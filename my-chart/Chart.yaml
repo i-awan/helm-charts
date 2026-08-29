@@ -2,5 +2,5 @@ apiVersion: v2
 name: my-chart
 description: My OpenShift application Helm chart
 type: application
-version: 1.0.0
+version: 1.0.1
 appVersion: "1.0.0"
