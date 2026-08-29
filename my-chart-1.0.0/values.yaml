@@ -1,0 +1,20 @@
+replicaCount: 1
+
+image:
+  repository: nginxinc/nginx-unprivileged  # Non-root nginx image
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    memory: "16Mi"
+    cpu: "50m"
+  limits:
+    memory: "32Mi"
+    cpu: "100m"
+
+env: default
