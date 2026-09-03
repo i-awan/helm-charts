@@ -1,0 +1,64 @@
+# Same single k3s cluster as values-standalone.yaml, but now exercising
+# the parts that actually matter before going multi-region: real quorum
+# (3 controllers), real replication (RF=3), real ISR/durability config,
+# TLS, and ACLs. Still `standalone: true` — no region node labels needed,
+# soft anti-affinity since this is still one Kubernetes cluster (pods may
+# still land on the same node if it's a single-node k3s VM, which is fine
+# for testing the Kafka-level mechanics; it just won't test real hardware
+# fault isolation — that only means something once you're on 3 real
+# clusters/nodes).
+
+standalone: true
+
+region:
+  name: standalone
+  mode: full
+
+# clusterID stays blank — this is a brand new test cluster, not a
+# continuation of your earlier RF=1 test (that data won't carry over
+# unless you kept the same clusterID and PVCs).
+cluster:
+  clusterID: ""
+  replicationFactor: 3
+  minInsyncReplicas: 2
+
+controllerIdOffset: 100
+brokerIdOffset: 110
+
+kraftController:
+  replicas: 3          # real quorum — try killing one pod later and watch it survive
+  storage:
+    class: ""
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kafka:
+  replicas: 3           # real replicas — try killing the leader's pod and watch re-election
+  storage:
+    class: ""
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  externalAccess:
+    enabled: false
+
+# Turn the real security posture back on now that the topology itself works.
+# Optional for THIS test specifically — TLS/ACLs are unrelated to
+# replication/quorum mechanics. Set both to false below if you'd rather
+# isolate variables and test replication in complete isolation first,
+# then validate TLS/ACLs as a separate pass afterward.
+tls:
+  enabled: true
+authorization:
+  enabled: true

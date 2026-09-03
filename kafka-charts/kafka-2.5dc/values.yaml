@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# Defaults. Every region overrides at minimum: region.name, region.mode,
+# idOffset (controllerIdOffset/brokerIdOffset), and cluster.clusterID
+# See values-region-a.yaml / values-region-b.yaml / values-05dc.yaml /
+# values-standalone.yaml.
+# ---------------------------------------------------------------------------
+
+namespace: confluent
+
+# Set true for a single-cluster test/dev install (see values-standalone.yaml).
+# Relaxes the two things that assume multi-cluster infra exists: region node
+# labels (nodeSelector) and hard pod anti-affinity (which needs >1 host).
+# Leave false for real region deployments.
+standalone: false
+
+# Identity of THIS region. mode "full" runs brokers + a controller.
+# mode "light" is the 0.5DC: controller only, no Kafka CR is rendered.
+region:
+  name: region-a
+  mode: full   # full | light
+
+# Settings that must be IDENTICAL across all three region installs —
+# this is what makes them one logical cluster instead of three clusters.
+cluster:
+  clusterID: ""   # leave blank on first bootstrap install, then fetch and reuse
+  name: kafka
+  replicationFactor: 3
+  minInsyncReplicas: 2
+
+# Every region needs distinct, non-overlapping ID ranges — and critically,
+# controller IDs and broker IDs must never overlap EVEN WITHIN THE SAME
+# REGION (Kafka's own startup validation rejects a broker node ID that's
+# also a controller quorum voter ID). Convention here: controllers get
+# <region-base>, brokers get <region-base + 10>, leaving headroom for a
+# handful of controllers before the broker range starts.
+#   region-a:    controllers 100-109, brokers 110+
+#   region-b:    controllers 200-209, brokers 210+
+#   region-05dc: controllers 300-309 (no brokers — light mode)
+# This cannot be changed after the cluster is created — plan spacing
+# generously if you expect to grow broker/controller counts later.
+controllerIdOffset: 100
+brokerIdOffset: 110
+
+image:
+  application: confluentinc/cp-server:7.9.0
+  init: confluentinc/confluent-init-container:3.3.0
+  controllerApplication: confluentinc/cp-server:7.9.0
+  controllerInit: confluentinc/confluent-init-container:3.3.0
+
+kraftController:
+  replicas: 1
+  storage:
+    class: ""
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+kafka:
+  replicas: 3
+  storage:
+    class: ""
+    size: 500Gi
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      cpu: "4"
+      memory: 16Gi
+  externalAccess:
+    enabled: false
+    type: loadBalancer
+    domain: ""
+
+tls:
+  enabled: true
+  secretRef: kafka-tls   # must be the SAME cert material, pre-created in every region's namespace
+                          # see scripts/generate-and-distribute-tls.sh
+
+# Simple ACL authorization (KRaft-compatible). This is the documented,
+# stable authorization path for KRaft-based CFK clusters. Full RBAC+MDS
+# in KRaft mode exists but is more version-sensitive across CFK releases
+# — check current Confluent docs before switching to it.
+authorization:
+  enabled: true
+  superUsers:
+    - User:kafka   # the broker's own inter-broker principal — must stay a super user
+
+allRegions:
+  - region-a
+  - region-b
+  - region-05dc

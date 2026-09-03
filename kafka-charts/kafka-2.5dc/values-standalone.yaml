@@ -1,0 +1,59 @@
+# Single-cluster test/dev deployment. Install this against ONE OpenShift
+# cluster, with the CFK operator already installed in it. No region node
+# labels, no cross-cluster networking, no second/third cluster required.
+#
+#   helm install kafka-test . -f values-standalone.yaml -n confluent
+#
+# Everything here is deliberately minimal so it comes up fast on a small
+# test cluster. Bump replicas/resources up as you actually exercise it.
+
+standalone: true
+
+region:
+  name: standalone   # cosmetic label only in this mode — no node selector is applied
+  mode: full           # renders both KRaftController and Kafka
+
+controllerIdOffset: 100
+brokerIdOffset: 110
+cluster:
+  clusterID: ""         # left blank — CFK generates one for this cluster
+  replicationFactor: 1  # bump to 3 once you add real brokers/nodes to test real replication
+  minInsyncReplicas: 1  # bump to 2 alongside RF=3 when you're testing durability behavior
+
+# Start with 1 controller for the fastest possible bring-up. Set this to 3
+# once you want to exercise real quorum/failover behavior locally before
+# committing to the full 3-region rollout.
+kraftController:
+  replicas: 1
+  storage:
+    class: ""     # use your test cluster's default StorageClass
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kafka:
+  replicas: 1     # bump to 3 to test real replica placement/ISR behavior
+  storage:
+    class: ""
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  externalAccess:
+    enabled: false   # keep traffic in-cluster for a quick test
+
+# Simplify for a fast first test — turn both back on once you're testing
+# something closer to the production posture.
+tls:
+  enabled: false
+authorization:
+  enabled: false

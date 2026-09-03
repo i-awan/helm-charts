@@ -1,0 +1,22 @@
+apiVersion: v2
+name: kafka-2.5dc
+description: >
+  Deploys the per-region Confluent for Kubernetes (CFK) custom resources
+  (KRaftController + Kafka) needed to build one stretched Kafka cluster
+  across a 2.5 datacenter (2.5DC) topology: two full regions running
+  brokers + a controller, and one lightweight 0.5DC region running only
+  a tiebreaker controller.
+
+  This chart is installed ONCE PER REGION (three times total), against
+  that region's own OpenShift cluster context, using a region-specific
+  values file. It does NOT install the CFK operator itself — install
+  confluentinc/confluent-for-kubernetes separately in each region first.
+type: application
+version: 0.1.0
+appVersion: "7.9.0"
+keywords:
+  - kafka
+  - confluent
+  - cfk
+  - multi-region
+  - 2.5dc

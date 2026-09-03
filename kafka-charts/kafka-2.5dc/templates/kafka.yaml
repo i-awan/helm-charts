@@ -1,0 +1,101 @@
+{{- if eq .Values.region.mode "full" }}
+apiVersion: platform.confluent.io/v1beta1
+kind: Kafka
+metadata:
+  name: {{ .Values.cluster.name }}
+  namespace: {{ .Values.namespace }}
+  annotations:
+    platform.confluent.io/broker-id-offset: {{ .Values.brokerIdOffset | quote }}
+spec:
+  replicas: {{ .Values.kafka.replicas }}
+  image:
+    application: {{ .Values.image.application }}
+    init: {{ .Values.image.init }}
+  dataVolumeCapacity: {{ .Values.kafka.storage.size }}
+  {{- if .Values.kafka.storage.class }}
+  storageClass:
+    name: {{ .Values.kafka.storage.class }}
+  {{- end }}
+  dependencies:
+    kRaftController:
+      clusterRef:
+        name: {{ include "kafka-2.5dc.controllerName" . }}
+        namespace: {{ .Values.namespace }}
+  {{- if .Values.authorization.enabled }}
+  authorization:
+    type: simple
+    superUsers:
+      {{- range .Values.authorization.superUsers }}
+      - {{ . }}
+      {{- end }}
+  {{- end }}
+  podTemplate:
+    resources:
+      requests:
+        cpu: {{ .Values.kafka.resources.requests.cpu | quote }}
+        memory: {{ .Values.kafka.resources.requests.memory | quote }}
+      limits:
+        cpu: {{ .Values.kafka.resources.limits.cpu | quote }}
+        memory: {{ .Values.kafka.resources.limits.memory | quote }}
+    affinity:
+      podAntiAffinity:
+        {{- if .Values.standalone }}
+        # Soft preference in standalone mode — same reasoning as the
+        # KRaftController template: don't block scheduling on a 1-2 node
+        # test cluster.
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: kafka
+              topologyKey: kubernetes.io/hostname
+        {{- else }}
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: kafka
+            topologyKey: kubernetes.io/hostname
+        {{- end }}
+    {{- if not .Values.standalone }}
+    nodeSelector:
+      # Requires nodes in this cluster to be labeled:
+      #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}
+      topology.kubernetes.io/region: {{ .Values.region.name }}
+    {{- end }}
+  configOverrides:
+    server:
+      # Rack awareness: ties replica placement to the region label above,
+      # so partition replicas spread across regions, not just brokers.
+      - broker.rack={{ .Values.region.name }}
+      - default.replication.factor={{ .Values.cluster.replicationFactor }}
+      - min.insync.replicas={{ .Values.cluster.minInsyncReplicas }}
+      # Never promote an out-of-sync replica — see conversation notes on
+      # why this must stay false for a stretched cluster.
+      - unclean.leader.election.enable=false
+      {{- if .Values.authorization.enabled }}
+      - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      - confluent.authorizer.access.rule.providers=KRAFT_ACL
+      {{- range .Values.authorization.superUsers }}
+      - super.users={{ . }}
+      {{- end }}
+      {{- end }}
+  listeners:
+    internal:
+      tls:
+        enabled: {{ .Values.tls.enabled }}
+        {{- if .Values.tls.enabled }}
+        secretRef: {{ .Values.tls.secretRef }}
+        {{- end }}
+    {{- if .Values.kafka.externalAccess.enabled }}
+    external:
+      externalAccess:
+        type: {{ .Values.kafka.externalAccess.type }}
+        {{- if .Values.kafka.externalAccess.domain }}
+        loadBalancer:
+          domain: {{ .Values.kafka.externalAccess.domain }}
+        {{- end }}
+      tls:
+        enabled: {{ .Values.tls.enabled }}
+    {{- end }}
+{{- end }}

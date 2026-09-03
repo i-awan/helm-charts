@@ -1,0 +1,27 @@
+# The tiebreaker region. Runs exactly one KRaftController pod, contributing
+# one vote to the shared quorum. No Kafka CR is rendered for this region
+# (region.mode=light) — no brokers, no partition data, minimal footprint.
+
+region:
+  name: region-05dc
+  mode: light
+
+# No brokerIdOffset needed — mode: light renders no Kafka CR.
+controllerIdOffset: 300
+
+# Paste the clusterID fetched from region-a here before installing.
+cluster:
+  clusterID: "REPLACE_WITH_CLUSTER_ID_FROM_REGION_A"
+
+kraftController:
+  replicas: 1
+  storage:
+    class: standard
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi

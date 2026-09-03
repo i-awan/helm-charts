@@ -1,0 +1,24 @@
+region:
+  name: region-a
+  mode: full
+
+controllerIdOffset: 100
+brokerIdOffset: 110
+
+# Set this AFTER region-a's first apply, once you've fetched the generated
+# clusterID (see README step 2) — needed on region-b and region-05dc only.
+cluster:
+  clusterID: ""
+
+kraftController:
+  storage:
+    class: ocs-storagecluster-ceph-rbd
+
+kafka:
+  replicas: 3
+  storage:
+    class: ocs-storagecluster-ceph-rbd
+  externalAccess:
+    enabled: true
+    type: loadBalancer
+    domain: kafka-region-a.example.internal

@@ -1,0 +1,23 @@
+region:
+  name: region-b
+  mode: full
+
+controllerIdOffset: 200
+brokerIdOffset: 210
+
+# Paste the clusterID fetched from region-a here before installing.
+cluster:
+  clusterID: "REPLACE_WITH_CLUSTER_ID_FROM_REGION_A"
+
+kraftController:
+  storage:
+    class: ocs-storagecluster-ceph-rbd
+
+kafka:
+  replicas: 3
+  storage:
+    class: ocs-storagecluster-ceph-rbd
+  externalAccess:
+    enabled: true
+    type: loadBalancer
+    domain: kafka-region-b.example.internal

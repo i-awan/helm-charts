@@ -1,0 +1,78 @@
+apiVersion: platform.confluent.io/v1beta1
+kind: KRaftController
+metadata:
+  name: {{ include "kafka-2.5dc.controllerName" . }}
+  namespace: {{ .Values.namespace }}
+  annotations:
+    platform.confluent.io/broker-id-offset: {{ .Values.controllerIdOffset | quote }}
+spec:
+  replicas: {{ .Values.kraftController.replicas }}
+  {{- if .Values.cluster.clusterID }}
+  clusterID: {{ .Values.cluster.clusterID | quote }}
+  {{- end }}
+  {{- if .Values.authorization.enabled }}
+  authorization:
+    type: simple
+    superUsers:
+      {{- range .Values.authorization.superUsers }}
+      - {{ . }}
+      {{- end }}
+  {{- end }}
+  image:
+    application: {{ .Values.image.controllerApplication }}
+    init: {{ .Values.image.controllerInit }}
+  dataVolumeCapacity: {{ .Values.kraftController.storage.size }}
+  {{- if .Values.kraftController.storage.class }}
+  storageClass:
+    name: {{ .Values.kraftController.storage.class }}
+  {{- end }}
+  podTemplate:
+    resources:
+      requests:
+        cpu: {{ .Values.kraftController.resources.requests.cpu | quote }}
+        memory: {{ .Values.kraftController.resources.requests.memory | quote }}
+      limits:
+        cpu: {{ .Values.kraftController.resources.limits.cpu | quote }}
+        memory: {{ .Values.kraftController.resources.limits.memory | quote }}
+    affinity:
+      podAntiAffinity:
+        {{- if .Values.standalone }}
+        # Soft preference in standalone mode — a single test cluster may
+        # only have 1-2 nodes, and a hard requirement would leave pods
+        # Pending forever if there's nowhere else to schedule them.
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: kraftcontroller
+              topologyKey: kubernetes.io/hostname
+        {{- else }}
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: kraftcontroller
+            topologyKey: kubernetes.io/hostname
+        {{- end }}
+    {{- if not .Values.standalone }}
+    nodeSelector:
+      # Requires nodes in this cluster to be labeled:
+      #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}
+      topology.kubernetes.io/region: {{ .Values.region.name }}
+    {{- end }}
+  {{- if .Values.authorization.enabled }}
+  configOverrides:
+    server:
+      - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      - confluent.authorizer.access.rule.providers=KRAFT_ACL
+      {{- range .Values.authorization.superUsers }}
+      - super.users={{ . }}
+      {{- end }}
+  {{- end }}
+  listeners:
+    controller:
+      tls:
+        enabled: {{ .Values.tls.enabled }}
+        {{- if .Values.tls.enabled }}
+        secretRef: {{ .Values.tls.secretRef }}
+        {{- end }}
