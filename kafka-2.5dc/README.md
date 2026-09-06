@@ -428,7 +428,42 @@ record's bytes replicated across the namespace boundary — see the
 Schema Registry walkthrough below for the Avro-aware version of this
 same test, with a fuller explanation of exactly what it proves.
 
-### 8. Schema Registry was already populated — no `helm upgrade` needed
+### 8. The schema-file convention — how `payment-schema.yaml` was authored
+
+`schemas/payment/payment-schema.yaml` already ships with this chart
+(that's why step 9 below needs no registration step) — this is the
+convention used to author it, useful when you want to add your own
+schema alongside it. The file lives inside the chart directory itself;
+`templates/schemas.yaml` discovers anything matching this pattern
+automatically via `.Files.Glob "schemas/**/*.yaml"`. It isn't a
+Kubernetes object at this point, just a file on disk:
+
+```bash
+mkdir -p schemas/shipments
+cat > schemas/shipments/shipments-schema.yaml << 'EOF'
+name: shipments
+subjects: shipments-value
+format: avro
+schema: |
+  {
+    "type": "record",
+    "name": "Shipment",
+    "namespace": "io.example.shipments",
+    "fields": [
+      { "name": "shipment_id", "type": "string" },
+      { "name": "order_id", "type": "string" },
+      { "name": "status", "type": "string" }
+    ]
+  }
+EOF
+```
+
+Dropping in a file like this and running `helm upgrade` gets it
+rendered and registered automatically — no template changes needed. The
+next step shows exactly what that rendering and registration produced
+for the `payment` schema already bundled with the chart.
+
+### 9. Schema Registry was already populated — no `helm upgrade` needed
 
 Unlike the from-scratch walkthrough later in this document, nothing
 extra needs installing here. `schemas/payment/payment-schema.yaml`
@@ -499,7 +534,7 @@ manual `curl`/CLI step — it's the same declarative, operator-reconciled
 pattern as the `Kafka` and `KRaftController` CRs themselves, just aimed
 at Schema Registry's REST API instead of the Kafka Admin API.
 
-### 9. Produce via region-a, consume via region-b — using the bundled schema
+### 10. Produce via region-a, consume via region-b — using the bundled schema
 
 Create the target topic (not auto-created):
 ```bash
@@ -509,7 +544,7 @@ kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
   --config min.insync.replicas=2
 ```
 
-Fetch the schema ID (from step 8's `curl` output, or re-run it), then
+Fetch the schema ID (from step 9's `curl` output, or re-run it), then
 produce from **region-a**:
 ```bash
 kubectl exec -it schemaregistry-0 -n kafka-region-a -- bash
@@ -605,54 +640,14 @@ kubectl get pods -n kafka-region-a
 ```
 Confirm `schemaregistry-0` reaches `1/1 Running`.
 
-### 2. Create your schema file, using the `schemas/<name>/<name>-schema.yaml` convention
-
-This file lives inside the chart directory itself — `templates/schemas.yaml`
-discovers it automatically via `.Files.Glob "schemas/**/*.yaml"` (see
-"How it works" below); it isn't a Kubernetes object yet at this point,
-just a file on disk.
-
-```bash
-mkdir -p schemas/payment
-cat > schemas/payment/payment-schema.yaml << 'EOF'
-name: payment
-subjects: payment-value
-format: avro
-schema: |
-  {
-    "type": "record",
-    "name": "Payment",
-    "namespace": "io.example.payment",
-    "fields": [
-      { "name": "payment_id", "type": "string" },
-      { "name": "order_id", "type": "string" },
-      { "name": "amount", "type": "double" },
-      { "name": "status", "type": "string" }
-    ]
-  }
-EOF
-```
-
-**How it works:** `templates/schemas.yaml` parses every file matching
-this pattern and renders a `ConfigMap` (holding the raw schema JSON,
-just inert text CFK reads once) + a `Schema` CR (holding `subject`,
-`format`, and a reference to that ConfigMap) per file. The CFK operator
-watches `Schema` CRs specifically, and reconciles each one by calling
-Schema Registry's REST API to register the schema — the CR and
-ConfigMap never leave Kubernetes; only the extracted schema payload
-does. Dropping in a second file, e.g.
-`schemas/shipments/shipments-schema.yaml` with the same four-field
-shape, gets picked up automatically on the next `helm upgrade` — no
-template changes needed.
-
-### 3. Apply it — creates the ConfigMap + Schema CR, registered via REST by the operator
+### 2. Apply it — creates the ConfigMap + Schema CR, registered via REST by the operator
 
 ```bash
 helm upgrade --install kafka-region-a . -f values-mock-region-a.yaml -n kafka-region-a
 kubectl get schema -n kafka-region-a
 ```
 
-### 4. Confirm registration and note the schema ID
+### 3. Confirm registration and note the schema ID
 
 ```bash
 kubectl exec -it schemaregistry-0 -n kafka-region-a -- \
@@ -661,7 +656,7 @@ kubectl exec -it schemaregistry-0 -n kafka-region-a -- \
 Note the `id` field — reference it directly in later steps rather than
 restating the full schema.
 
-### 5. Create the target topic explicitly — don't assume auto-create
+### 4. Create the target topic explicitly — don't assume auto-create
 
 ```bash
 kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
@@ -669,13 +664,13 @@ kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
   --partitions 3 --replication-factor 3 --config min.insync.replicas=2
 ```
 
-### 6. Produce a conforming message
+### 5. Produce a conforming message
 
 ```bash
 kubectl exec -it schemaregistry-0 -n kafka-region-a -- bash
 LOG_DIR=/tmp kafka-avro-console-producer --broker-list kafka.kafka-region-a.svc.cluster.local:9092 --topic payment \
   --property schema.registry.url=http://localhost:8081 \
-  --property value.schema.id=<id-from-step-4>
+  --property value.schema.id=<id-from-step-3>
 ```
 Type, then **`Ctrl+D`** (not `Ctrl+C` — a hard kill can skip flushing
 the record before the process exits):
@@ -688,7 +683,7 @@ log path (not writable under a non-root SCC/security-policy UID) —
 without it, the producer/consumer CLI can die *before* actually sending
 or reading anything.
 
-### 7. The valuable test: consume via region-b, not region-a — proving replication is physically real
+### 6. The valuable test: consume via region-b, not region-a — proving replication is physically real
 
 ```bash
 kubectl exec -it schemaregistry-0 -n kafka-region-b -- bash
@@ -729,9 +724,9 @@ If you only run one validation step after building this chart, make it
 this one — a same-region produce/consume test can pass even when the
 multi-region wiring is completely broken; this test cannot.
 
-### 8. Produce a non-conforming message, to see enforcement actually reject it
+### 7. Produce a non-conforming message, to see enforcement actually reject it
 
-Same producer command as step 6, but with a payload that violates the
+Same producer command as step 5, but with a payload that violates the
 schema — e.g. a missing required field and the wrong type on `amount`:
 ```json
 {"payment_id": "pay-2", "amount": "not-a-number", "status": "created"}
