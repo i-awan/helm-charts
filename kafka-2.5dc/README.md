@@ -428,6 +428,88 @@ record's bytes replicated across the namespace boundary — see the
 Schema Registry walkthrough below for the Avro-aware version of this
 same test, with a fuller explanation of exactly what it proves.
 
+### 8. Schema Registry was already populated — no `helm upgrade` needed
+
+Unlike the from-scratch walkthrough later in this document, nothing
+extra needs installing here. `schemas/payment/payment-schema.yaml`
+ships with this chart, and `schemaRegistry.enabled`/`schemas.enabled`
+both default to `true` — so the moment `helm install` ran in step 4,
+the `payment` schema was already rendered and registered. Confirm it:
+
+```bash
+kubectl exec -it schemaregistry-0 -n kafka-region-a -- \
+  curl -s http://localhost:8081/subjects/payment-value/versions/latest
+```
+This should already return a registered schema — nothing to create.
+
+**What actually happened under the hood, back at step 4, worth being
+explicit about:**
+
+1. **`templates/schemas.yaml`** found `schemas/payment/payment-schema.yaml`
+   inside the chart (via `.Files.Glob "schemas/**/*.yaml"`) and rendered
+   two Kubernetes objects from it: a `ConfigMap` named
+   `payment-schema-config` (holding the raw Avro JSON as plain text —
+   Kubernetes doesn't parse or validate it, it's just inert data at this
+   point) and a `Schema` custom resource named `payment` (holding
+   `spec.name: payment-value`, `spec.data.format: avro`, and a reference
+   to that ConfigMap).
+2. **The CFK operator**, watching for `Schema` CRs, picked this one up,
+   read the referenced ConfigMap's content, and made a real REST call —
+   `POST /subjects/payment-value/versions` — against the `SchemaRegistry`
+   instance this same chart install had just stood up.
+3. **Schema Registry** validated the schema, assigned it a version and a
+   globally unique schema ID, and durably persisted that registration as
+   an actual Kafka record in its internal `_schemas` compacted topic —
+   on the same underlying Kafka cluster, not a separate store.
+4. **The operator wrote the result back** into the `Schema` CR's
+   `.status` field — which is exactly what the `kubectl get schema
+   payment -n kafka-region-a -o yaml` command would show you, if you
+   want to see the registered version/ID reflected there too.
+
+None of this required a topic to exist, a producer to run, or any
+manual `curl`/CLI step — it's the same declarative, operator-reconciled
+pattern as the `Kafka` and `KRaftController` CRs themselves, just aimed
+at Schema Registry's REST API instead of the Kafka Admin API.
+
+### 9. Produce via region-a, consume via region-b — using the bundled schema
+
+Create the target topic (not auto-created):
+```bash
+kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
+  --bootstrap-server localhost:9092 \
+  --create --topic payment --partitions 3 --replication-factor 3 \
+  --config min.insync.replicas=2
+```
+
+Fetch the schema ID (from step 8's `curl` output, or re-run it), then
+produce from **region-a**:
+```bash
+kubectl exec -it schemaregistry-0 -n kafka-region-a -- bash
+LOG_DIR=/tmp kafka-avro-console-producer --broker-list kafka.kafka-region-a.svc.cluster.local:9092 --topic payment \
+  --property schema.registry.url=http://localhost:8081 \
+  --property value.schema.id=<id-from-step-8>
+```
+Type, then **`Ctrl+D`**:
+```json
+{"payment_id": "pay-1", "order_id": "order-101", "amount": 49.99, "status": "created"}
+```
+
+Consume from **region-b** — a different namespace, a different
+broker, a different (never-registered-anything-itself) Schema Registry
+instance:
+```bash
+kubectl exec -it schemaregistry-0 -n kafka-region-b -- bash
+LOG_DIR=/tmp kafka-avro-console-consumer --bootstrap-server kafka.kafka-region-b.svc.cluster.local:9092 --topic payment \
+  --property schema.registry.url=http://localhost:8081 \
+  --from-beginning
+```
+Expected output — decoded correctly on region-b's side, proving the
+replication and the shared `_schemas` topic both genuinely span the
+cluster, not just region-a in isolation:
+```json
+{"payment_id":"pay-1","order_id":"order-101","amount":49.99,"status":"created"}
+```
+
 ## Deploying: real 2.5DC (3 separate clusters)
 
 Same shape as above, but each region is a genuinely separate Kubernetes
