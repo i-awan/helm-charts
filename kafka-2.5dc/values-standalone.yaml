@@ -9,6 +9,12 @@
 
 standalone: true
 
+# Anti-affinity strictness is now driven purely by nodeSelector.enabled
+# (not standalone) — set explicitly here to keep soft scheduling on a
+# small/single-node test cluster.
+nodeSelector:
+  enabled: false
+
 region:
   name: standalone   # cosmetic label only in this mode — no node selector is applied
   mode: full           # renders both KRaftController and Kafka

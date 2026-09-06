@@ -21,6 +21,17 @@ spec:
       clusterRef:
         name: {{ include "kafka-2.5dc.controllerName" . }}
         namespace: {{ .Values.namespace }}
+      {{- if .Values.tls.enabled }}
+      # Required by CFK whenever the KRaftController's own controller
+      # listener has TLS enabled — this is NOT inherited automatically
+      # via clusterRef, and must be configured identically to the
+      # KRaftController CR's listeners.controller.tls block, or the
+      # broker connects to the controller port in plaintext and fails
+      # with "Unrecognized SSL message, plaintext connection?"
+      controllerListener:
+        tls:
+          enabled: true
+      {{- end }}
   {{- if .Values.authorization.enabled }}
   authorization:
     type: simple
@@ -39,10 +50,9 @@ spec:
         memory: {{ .Values.kafka.resources.limits.memory | quote }}
     affinity:
       podAntiAffinity:
-        {{- if .Values.standalone }}
-        # Soft preference in standalone mode — same reasoning as the
-        # KRaftController template: don't block scheduling on a 1-2 node
-        # test cluster.
+        {{- if not .Values.nodeSelector.enabled }}
+        # Soft preference when nodeSelector.enabled: false — same
+        # reasoning as the KRaftController template.
         preferredDuringSchedulingIgnoredDuringExecution:
           - weight: 100
             podAffinityTerm:
@@ -57,7 +67,7 @@ spec:
                 app: kafka
             topologyKey: kubernetes.io/hostname
         {{- end }}
-    {{- if not .Values.standalone }}
+    {{- if and (not .Values.standalone) .Values.nodeSelector.enabled }}
     nodeSelector:
       # Requires nodes in this cluster to be labeled:
       #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}

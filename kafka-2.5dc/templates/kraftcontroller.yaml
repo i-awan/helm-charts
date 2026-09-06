@@ -36,10 +36,12 @@ spec:
         memory: {{ .Values.kraftController.resources.limits.memory | quote }}
     affinity:
       podAntiAffinity:
-        {{- if .Values.standalone }}
-        # Soft preference in standalone mode — a single test cluster may
-        # only have 1-2 nodes, and a hard requirement would leave pods
-        # Pending forever if there's nowhere else to schedule them.
+        {{- if not .Values.nodeSelector.enabled }}
+        # Soft preference when nodeSelector.enabled: false — if you can't
+        # guarantee node labels, you likely can't guarantee enough
+        # distinct nodes for a hard requirement either. A required
+        # constraint here would leave pods Pending forever if there's
+        # nowhere else to schedule them.
         preferredDuringSchedulingIgnoredDuringExecution:
           - weight: 100
             podAffinityTerm:
@@ -54,19 +56,37 @@ spec:
                 app: kraftcontroller
             topologyKey: kubernetes.io/hostname
         {{- end }}
-    {{- if not .Values.standalone }}
+    {{- if and (not .Values.standalone) .Values.nodeSelector.enabled }}
     nodeSelector:
       # Requires nodes in this cluster to be labeled:
       #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}
       topology.kubernetes.io/region: {{ .Values.region.name }}
     {{- end }}
-  {{- if .Values.authorization.enabled }}
+  {{- if or .Values.authorization.enabled .Values.staticQuorumVoters }}
   configOverrides:
     server:
+      {{- if .Values.staticQuorumVoters }}
+      # Static quorum via the raw Kafka property, not CFK's structured
+      # `listeners.controllerQuorumVoters` field — that field was
+      # rejected as "unknown field" by this cluster's installed CRD
+      # version, so this is the version-independent fallback.
+      # configOverrides entries are appended after CFK's own generated
+      # config, so this correctly overrides whatever single-node default
+      # CFK would otherwise auto-generate.
+      #
+      # This SAME comma-separated voter list — every controller across
+      # every region — must appear identically on every region's
+      # KRaftController CR, not just a self-reference. Matching
+      # clusterID alone does not form one cross-namespace/cross-cluster
+      # quorum (confirmed the hard way — see README).
+      - controller.quorum.voters={{ range $i, $v := .Values.staticQuorumVoters }}{{ if $i }},{{ end }}{{ $v.nodeId }}@{{ $v.brokerEndpoint }}{{ end }}
+      {{- end }}
+      {{- if .Values.authorization.enabled }}
       - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
       - confluent.authorizer.access.rule.providers=KRAFT_ACL
       {{- range .Values.authorization.superUsers }}
       - super.users={{ . }}
+      {{- end }}
       {{- end }}
   {{- end }}
   listeners:

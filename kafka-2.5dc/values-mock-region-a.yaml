@@ -1,0 +1,84 @@
+# Mocks "region-a" as a namespace on your SINGLE real cluster, instead of
+# a separate Kubernetes cluster. Tests the Kafka-level mechanics (clusterID
+# bootstrap, rack-awareness, cross-region replica placement) since it's
+# all one cluster's flat networking underneath.
+#
+# What this does NOT test: the actual cross-cluster networking
+# prerequisites from the README (non-overlapping pod CIDRs, cross-cluster
+# DNS) — those don't apply within one cluster, so they remain unvalidated
+# until you move to genuinely separate clusters. Treat this as a
+# de-risking step, not a full substitute for the real rollout.
+
+namespace: kafka-region-a
+
+# Parked for now — focus is proving multi-region mechanics first
+# (clusterID bootstrap, rack-aware placement, node-label scheduling).
+# Re-enable once that's solid; see README's TLS section for the
+# fullchain.pem/privkey.pem/cacerts.pem setup and why it needs
+# controllerListener.tls wired on the Kafka CR too.
+tls:
+  enabled: false
+authorization:
+  enabled: false
+
+region:
+  name: region-a
+  mode: full
+
+controllerIdOffset: 100
+brokerIdOffset: 110
+
+# Left blank — this namespace bootstraps first and generates the
+# clusterID, same as the real region-a would.
+cluster:
+  clusterID: ""
+
+kraftController:
+  storage:
+    class: ""   # use this cluster's default StorageClass
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kafka:
+  replicas: 2   # trimmed for a small/single-node test cluster — bump once on real multi-node infra
+  storage:
+    class: ""
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  externalAccess:
+    enabled: false   # no real external DNS/LB needed for an in-cluster mock
+
+# Default (values.yaml) points at the "confluent" namespace, which is
+# wrong here — this mock deployment's Kafka service lives in
+# kafka-region-a, not confluent. Without this override, Schema Registry
+# crash-loops on DNS resolution failure the same way it did before.
+schemaRegistry:
+  kafkaBootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9092
+
+# Node labels still need to be REAL and distinct per mocked region — a
+# namespace alone doesn't create fault isolation. Label an actual subset
+# of your nodes before installing:
+#   oc label node <node1> <node2> topology.kubernetes.io/region=region-a
+
+# Identical across all 3 mock values files — every controller, every region.
+staticQuorumVoters:
+  - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
+    nodeId: 100
+  - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
+    nodeId: 200
+  - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
+    nodeId: 300
+
+nodeSelector:
+  enabled: false

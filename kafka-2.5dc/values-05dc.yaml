@@ -25,3 +25,6 @@ kraftController:
     limits:
       cpu: "500m"
       memory: 1Gi
+
+nodeSelector:
+  enabled: false

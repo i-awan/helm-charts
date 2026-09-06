@@ -22,3 +22,6 @@ kafka:
     enabled: true
     type: loadBalancer
     domain: kafka-region-a.example.internal
+
+nodeSelector:
+  enabled: false

@@ -1,0 +1,33 @@
+{{- if and .Values.schemas.enabled (eq .Values.region.mode "full") }}
+{{- range $path, $_ := .Files.Glob "schemas/**/*.yaml" }}
+{{- $schemaDef := $.Files.Get $path | fromYaml }}
+---
+# Rendered from {{ $path }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $schemaDef.name }}-schema-config
+  namespace: {{ $.Values.namespace }}
+data:
+  schema: |
+{{ $schemaDef.schema | indent 4 }}
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: Schema
+metadata:
+  name: {{ $schemaDef.name }}
+  namespace: {{ $.Values.namespace }}
+spec:
+  # Subject name for this schema. Per Confluent's docs: if omitted, the
+  # Schema CR's own metadata.name is used as the subject instead — so
+  # this is only needed when you want a subject name that differs from
+  # the CR name (which is the case here, since your files use "subjects"
+  # explicitly rather than relying on the CR name).
+  name: {{ $schemaDef.subjects }}
+  data:
+    configRef: {{ $schemaDef.name }}-schema-config
+    format: {{ $schemaDef.format }}
+  schemaRegistryClusterRef:
+    name: {{ $.Values.schemaRegistry.clusterRefName }}
+{{- end }}
+{{- end }}

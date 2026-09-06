@@ -10,6 +10,11 @@
 
 standalone: true
 
+# Anti-affinity strictness is now driven purely by nodeSelector.enabled
+# (not standalone) — set explicitly here to keep soft scheduling.
+nodeSelector:
+  enabled: false
+
 region:
   name: standalone
   mode: full

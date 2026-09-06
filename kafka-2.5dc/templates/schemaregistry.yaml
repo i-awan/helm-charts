@@ -1,0 +1,60 @@
+{{- if and .Values.schemaRegistry.enabled (eq .Values.region.mode "full") }}
+apiVersion: platform.confluent.io/v1beta1
+kind: SchemaRegistry
+metadata:
+  name: {{ .Values.schemaRegistry.clusterRefName }}
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.schemaRegistry.replicas }}
+  image:
+    application: {{ .Values.schemaRegistry.image.application }}
+    init: {{ .Values.schemaRegistry.image.init }}
+  dependencies:
+    kafka:
+      bootstrapEndpoint: {{ .Values.schemaRegistry.kafkaBootstrapEndpoint }}
+      {{- if .Values.tls.enabled }}
+      tls:
+        enabled: true
+        secretRef: {{ .Values.tls.secretRef }}
+      {{- end }}
+  podTemplate:
+    resources:
+      requests:
+        cpu: {{ .Values.schemaRegistry.resources.requests.cpu | quote }}
+        memory: {{ .Values.schemaRegistry.resources.requests.memory | quote }}
+      limits:
+        cpu: {{ .Values.schemaRegistry.resources.limits.cpu | quote }}
+        memory: {{ .Values.schemaRegistry.resources.limits.memory | quote }}
+    {{- if and (not .Values.standalone) .Values.nodeSelector.enabled }}
+    nodeSelector:
+      topology.kubernetes.io/region: {{ .Values.region.name }}
+    {{- end }}
+    {{- if .Values.schemaRegistry.waitForKafka.enabled }}
+    {{- $kb := split ":" .Values.schemaRegistry.kafkaBootstrapEndpoint }}
+    initContainers:
+      # Blocks with a clean, expected "waiting for..." log line until
+      # Kafka's listener is actually reachable, instead of letting the
+      # main schemaregistry container crash-loop with a Java stack trace
+      # while Kafka is still coming up. Purely a UX/log-cleanliness fix —
+      # Schema Registry would eventually succeed via its own retries
+      # either way; this just makes the wait visible and quiet.
+      - name: wait-for-kafka
+        image: {{ .Values.schemaRegistry.waitForKafka.image }}
+        command:
+          - sh
+          - -c
+          - |
+            until nc -z -w2 {{ $kb._0 }} {{ $kb._1 }}; do
+              echo "waiting for kafka at {{ .Values.schemaRegistry.kafkaBootstrapEndpoint }}..."
+              sleep 5
+            done
+            echo "kafka is reachable, continuing"
+    {{- end }}
+  {{- if .Values.tls.enabled }}
+  listeners:
+    api:
+      tls:
+        enabled: true
+        secretRef: {{ .Values.tls.secretRef }}
+  {{- end }}
+{{- end }}

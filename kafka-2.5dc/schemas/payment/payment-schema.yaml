@@ -1,0 +1,15 @@
+name: payment
+subjects: payment-value
+format: avro
+schema: |
+  {
+    "type": "record",
+    "name": "Payment",
+    "namespace": "io.example.payment",
+    "fields": [
+      { "name": "payment_id", "type": "string" },
+      { "name": "order_id", "type": "string" },
+      { "name": "amount", "type": "double" },
+      { "name": "status", "type": "string" }
+    ]
+  }

@@ -1,0 +1,62 @@
+namespace: kafka-region-b
+
+# Parked for now — see values-mock-region-a.yaml for why.
+tls:
+  enabled: false
+authorization:
+  enabled: false
+
+region:
+  name: region-b
+  mode: full
+
+controllerIdOffset: 200
+brokerIdOffset: 210
+
+# Paste the clusterID fetched from region-a's namespace here before installing.
+cluster:
+  clusterID: "YzkyNTdiYTgtMzdkOS00MQ"
+
+kraftController:
+  storage:
+    class: ""
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kafka:
+  replicas: 1   # trimmed for a small/single-node test cluster — bump once on real multi-node infra
+  storage:
+    class: ""
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  externalAccess:
+    enabled: false
+
+schemaRegistry:
+  kafkaBootstrapEndpoint: kafka.kafka-region-b.svc.cluster.local:9092
+
+# Label a DIFFERENT subset of real nodes than region-a used:
+#   oc label node <node3> <node4> topology.kubernetes.io/region=region-b
+
+# Identical across all 3 mock values files — every controller, every region.
+staticQuorumVoters:
+  - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
+    nodeId: 100
+  - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
+    nodeId: 200
+  - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
+    nodeId: 300
+
+nodeSelector:
+  enabled: false

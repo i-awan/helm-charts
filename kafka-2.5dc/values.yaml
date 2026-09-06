@@ -13,6 +13,32 @@ namespace: confluent
 # Leave false for real region deployments.
 standalone: false
 
+# Static KRaft quorum voters — required for genuine cross-namespace/
+# cross-cluster quorum formation. Matching `cluster.clusterID` across
+# regions is NOT sufficient by itself (confirmed via
+# `kafka-metadata-quorum describe --status`: regions never appeared as
+# voters OR observers without this). This exact list — every controller
+# across every region — must be set IDENTICALLY on every region's values
+# file, not just pointing at itself. Left empty by default; each
+# values-mock-*.yaml / values-region-*.yaml overrides it with the full
+# list once all region names/namespaces are known (endpoints are
+# deterministic from the naming convention, so this can be computed
+# upfront — no need to fetch anything first, unlike clusterID).
+staticQuorumVoters: []
+
+# Set false if you (or whoever is installing this) don't have privileges
+# to apply node labels (e.g. `oc label node`), or the labels genuinely
+# don't exist yet. Independent of `standalone` — lets you keep real
+# multi-broker/multi-region settings (hard anti-affinity, mode: full,
+# real replica counts) while skipping only the nodeSelector requirement.
+# Skipping this means Kubernetes is free to schedule this region's pods
+# onto ANY node, including nodes another region's pods might land on
+# (in the mock/single-cluster setup) — so broker.rack's value stops being
+# a reliable description of physical placement. Fine for functional
+# testing; not something to leave off for a real production rollout.
+nodeSelector:
+  enabled: true
+
 # Identity of THIS region. mode "full" runs brokers + a controller.
 # mode "light" is the 0.5DC: controller only, no Kafka CR is rendered.
 region:
@@ -95,3 +121,41 @@ allRegions:
   - region-a
   - region-b
   - region-05dc
+
+# Every schemas/**/*.yaml file (your existing name/subjects/format/schema
+# layout) gets rendered into a ConfigMap + Schema CR pair automatically —
+# see templates/schemas.yaml. Requires a running SchemaRegistry CR already
+# named per schemaRegistry.clusterRefName below; this chart doesn't deploy
+# Schema Registry itself.
+schemas:
+  enabled: true
+
+schemaRegistry:
+  enabled: true
+  clusterRefName: schemaregistry   # must match metadata.name below
+  replicas: 1
+  image:
+    application: confluentinc/cp-schema-registry:7.9.0
+    init: confluentinc/confluent-init-container:3.3.0
+  # Internal Kafka listener this Schema Registry instance connects to.
+  # DO NOT trust this default — verify against your actual cluster first:
+  #   kubectl get svc -n confluent
+  #   kubectl get kafka <name> -n confluent -o yaml | grep -A15 listeners
+  # A wrong hostname/port here causes a DNS-resolution crash loop on
+  # Schema Registry startup (KafkaException: Failed to create new
+  # KafkaAdminClient) — it fails fast rather than falling back to
+  # anything, so this value must be exactly right.
+  kafkaBootstrapEndpoint: kafka.confluent.svc.cluster.local:9092
+  # Init container that blocks until Kafka's listener is reachable before
+  # the real schemaregistry container starts — avoids a noisy crash-loop
+  # while Kafka is still coming up (see templates/schemaregistry.yaml).
+  waitForKafka:
+    enabled: true
+    image: busybox:1.36
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
