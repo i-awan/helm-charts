@@ -453,6 +453,34 @@ explicit about:**
    point) and a `Schema` custom resource named `payment` (holding
    `spec.name: payment-value`, `spec.data.format: avro`, and a reference
    to that ConfigMap).
+
+   Concretely, this is the actual `ConfigMap` that got created in
+   `kafka-region-a` during step 4 — confirm it yourself with
+   `kubectl get configmap payment-schema-config -n kafka-region-a -o yaml`:
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: payment-schema-config
+     namespace: kafka-region-a
+   data:
+     schema: |
+       {
+         "type": "record",
+         "name": "Payment",
+         "namespace": "io.example.payment",
+         "fields": [
+           { "name": "payment_id", "type": "string" },
+           { "name": "order_id", "type": "string" },
+           { "name": "amount", "type": "double" },
+           { "name": "status", "type": "string" }
+         ]
+       }
+   ```
+   Notice this is just your `schemas/payment/payment-schema.yaml`
+   file's `schema:` block, copied verbatim into a Kubernetes object —
+   nothing added, nothing transformed. The `Schema` CR (below) is the
+   part that actually turns this inert text into a real registration.
 2. **The CFK operator**, watching for `Schema` CRs, picked this one up,
    read the referenced ConfigMap's content, and made a real REST call —
    `POST /subjects/payment-value/versions` — against the `SchemaRegistry`
