@@ -1,0 +1,65 @@
+Kafka 2.5DC Multi-Region Deployment on OpenShift
+Using Confluent for Kubernetes (CFK) — Architecture & Validation Summary
+Prepared for: OpenShift / Platform Engineering review
+1. Executive Summary
+This document summarizes the design and progressive validation of a Helm chart that deploys Apache Kafka, via Confluent for Kubernetes (CFK), as one logical cluster stretched across a 2.5-datacenter (2.5DC) topology: two full regions running brokers and a controller each, plus one lightweight witness region running only a KRaft controller.
+Validation used a namespace-simulated three-region topology on one real OpenShift cluster before committing to genuine multi-cluster infrastructure. The most significant outcome: matching a shared clusterID across regions is necessary but not sufficient to form one controller quorum — a real gap, found and resolved during this phase (Section 8.1). A second finding — several CFK custom-resource fields are silently ignored rather than rejected on the installed CRD version — has direct implications for pre-production version checks (Section 8.2). As of this writing, the simulated topology is fully validated end to end: a genuine three-node quorum, RF=3 replication with real cross-namespace placement, and Avro produce/consume proven to replicate correctly across namespace boundaries.
+2. Objective and Scope
+Produce a reusable Helm chart deploying Kafka as one logical cluster in a 2.5DC shape, able to survive the loss of any single region without data loss or extended unavailability. This phase built the chart and validated the multi-region mechanics — quorum formation, rack-aware placement, cross-region replication, schema governance — using a namespace simulation of three regions on one cluster, deliberately deferring genuine cross-cluster networking (non-overlapping pod CIDRs, cross-cluster DNS) to a later phase so Kafka-level logic could be proven correct first, on infrastructure already available.
+3. Why 2.5DC
+KRaft controllers require a Raft majority vote before any metadata change commits. Two consequences: the controller count must be odd (an even split can deadlock with no majority in either half), and a cluster spanning exactly two physical locations can never be made safe — whichever site ends up holding the majority is a single point of failure for the whole control plane, regardless of which site that turns out to be.
+2.5DC is the minimal fix: two full regions plus one lightweight witness running only a tiebreaker controller. Three locations, an odd total, no site ever holding the deciding majority alone.
+Region lost	Outcome
+Region A	B + 0.5DC hold 2 of 3 — quorum intact, normal operation
+Region B	A + 0.5DC hold 2 of 3 — quorum intact
+0.5DC	A + B hold 2 of 3 — quorum intact, reduced fault tolerance until restored
+4. Concepts and Topology
+    • Topic/Partition: a named, append-only stream split into independently-ordered partitions for parallelism.
+    • Replica/Leader/Follower: each partition has physical copies across brokers; exactly one is leader (serves all reads/writes) at a time.
+    • Controller (KRaft): a small quorum, separate from brokers, owning cluster metadata via Raft consensus. Brokers hold data; controllers hold decisions.
+    • broker.rack / clusterID: broker.rack drives rack-aware replica placement (one value per region here); clusterID is the identifier shared by every node in one logical Kafka cluster, unrelated to any Kubernetes-level identity.
+Region	Role	Components	IDs (this build)
+region-a	Full	Controller + brokers + Schema Registry	Controller 100 · Brokers 110, 111
+region-b	Full	Controller + brokers + Schema Registry	Controller 200 · Broker 210
+region-05dc	Witness	Controller only — no brokers, no data	Controller 300
+Controller and broker IDs are spaced by region (100/200/300-series) since each region's CFK operator otherwise numbers nodes independently starting from the same low values, risking collisions across the shared cluster.
+5. OpenShift-Specific Considerations
+    • SecurityContextConstraints: CFK pods' UIDs don't satisfy the default restricted SCC. Two validated paths — relax to OpenShift's arbitrary-UID convention (lower overhead), or a custom SCC with a fixed UID/GID range (appropriate for compliance requirements). A separate cluster-wide pod-security admission policy was also encountered, requiring an explicit runAsNonRoot independent of the SCC layer.
+    • Storage: left unset by default to use the cluster's dynamic provisioner; provisioning latency can present as a transient scheduling failure and shouldn't be mistaken for misconfiguration.
+    • Node labeling: real fault-domain separation needs both a nodeSelector (Kubernetes-level, pinning pods to labeled nodes) and broker.rack (Kafka-level, driving placement) together. Section 8.2 documents a CRD-compatibility finding currently affecting the nodeSelector half on the validated cluster.
+6. Helm Chart Design
+Values files	Purpose	Scope
+values-mock-region-a/b, values-mock-05dc	Simulate the 3-region topology as 3 namespaces on 1 cluster — the primary validation vehicle this phase	1 cluster, 3 ns
+values-region-a/b, values-05dc	Genuine multi-cluster rollout	3 clusters
+Key parameters: clusterID (shared), controllerIdOffset/brokerIdOffset (unique per region), staticQuorumVoters (Section 8.1), tls.enabled/authorization.enabled (currently parked, Section 9). Schema governance is declarative: definitions ship as files, rendered into a ConfigMap plus a CFK Schema resource, reconciled by the operator against Schema Registry's REST API — the same operator pattern used for Kafka and KRaftController themselves.
+7. Validation Strategy
+Two stages: (1) namespace-simulated 3-region topology on one cluster, validating quorum formation, rack-aware placement, and cross-namespace replication; (2, pending) genuine three-cluster rollout, validating the cross-cluster networking prerequisites a single cluster's flat networking cannot exercise. This let a significant defect (8.1) be found and fixed cheaply, on infrastructure already available.
+7.1 The definitive proof point
+The most important validation step was not same-region produce/consume — a broken, effectively single-region deployment could pass that. What actually validates the claim: produce through region-a's broker, consume through region-b's broker and its independent Schema Registry, which never registered the schema itself. This one test proves physical cross-region replication, a schema successfully resolved from the shared metadata topic without local registration, and the static quorum voter list genuinely functioning — and was performed successfully.
+8. Key Findings
+8.1 Cross-region KRaft quorum needs an explicit static voter list
+Identical clusterID values were assumed sufficient to form one quorum. Disproven via kafka-metadata-quorum describe --status: region-a's controller showed only itself as a voter, with region-b and the 0.5DC entirely absent — not merely unpromoted. clusterID is an identity check performed once controllers already communicate, not a discovery mechanism. Resolution: an explicit, identical static voter list (every controller, every region, by node ID and endpoint) on every controller. Confirmed working: all three report as voters, all brokers as observers of one shared quorum, with successful RF=3 topic creation and real cross-namespace placement.
+8.2 CRD schema version compatibility — silent field rejection
+Three CFK custom-resource fields, each matching current upstream documentation, were silently rejected as unknown fields by the installed CRD version — no failed install, just an easily-missed warning: a structured quorum-voters field (superseded by a raw configOverrides property, not subject to the same validation), a Schema Registry startup-ordering initContainer (cosmetic), and pod-level nodeSelector (operationally significant — node-label scheduling doesn't currently work regardless of chart config). Mitigation: treat any “unknown field” warning as release-blocking, and prefer configOverrides over newer structured fields where CRD alignment can't be confirmed.
+8.3 TLS material portability
+OpenSSL-generated JKS/PKCS12 keystores (to avoid a Java Runtime dependency) failed silently under Java's keystore provider due to OpenSSL 3.x's default cipher, surfacing only later as a Kafka SSL startup exception. Resolved by switching to CFK's PEM-based secret format, removing the cross-toolchain risk entirely.
+8.4 Schema Registry: one per region is a deliberate tradeoff, not a hard requirement
+Schema Registry holds no state of its own — it is a stateless REST facade over the same shared, compacted _schemas topic on the underlying Kafka cluster. This was proven directly: region-b's instance correctly resolved a schema it never registered itself. A single Schema Registry instance could technically serve every region. Per-region deployment is still the recommended default for two reasons: latency (every cross-region schema lookup pays the inter-region network cost, at least until client-side caching warms up) and availability (a single shared instance becomes a dependency for schema resolution across every region, even if Kafka itself remains healthy via the remaining quorum).
+8.5 Producers are leader-bound; only consumers can be kept region-local
+Producers cannot be guaranteed region-local traffic: a producer must write to whichever broker currently leads the target partition, and leadership rotates across all brokers regardless of region to balance load — there is no local-follower-relay mechanism. Consumers are different: followers hold valid, readable data, and Kafka's rack-aware fetching (replica.selector.class=RackAwareReplicaSelector on the broker, client.rack set on the consumer) lets a region-a consumer read from a local replica instead of always crossing to the leader. This is a preference, not a guarantee — it falls back to the leader when no local replica exists — and requires the consuming application to set client.rack itself; nothing server-side can force this on an unconfigured client.
+9. Outstanding Work and Recommendations
+    • Execute the genuine three-cluster rollout, specifically validating cross-cluster networking prerequisites a namespace simulation cannot exercise.
+    • Confirm CFK operator/CRD version against current documentation before relying on any structured custom-resource field, and re-verify node-label scheduling (8.2) on the production version.
+    • Re-enable TLS and ACL authorization (currently parked), using the PEM-based approach validated in 8.3; layer mutual TLS or SASL before relying on ACLs for anything security-relevant, since TLS alone authenticates the server, not the client.
+    • Decide per-region Schema Registry placement deliberately using the latency/availability tradeoff in 8.4, rather than defaulting to “one everywhere” without consideration.
+    • Configure client.rack on consuming applications where cross-region read traffic is a cost concern (8.5); establish a disaster-recovery runbook for controller-quorum loss scenarios specific to this topology.
+10. Glossary
+Term	Definition
+2.5DC	Two full regions plus one lightweight witness (“0.5”) region running only a quorum tiebreaker controller.
+KRaft	Kafka's Raft-based consensus protocol for cluster metadata, replacing ZooKeeper.
+Quorum / Voter / Observer	Controller nodes that vote on metadata (voters) versus non-voting members that replicate without voting (observers).
+clusterID	Identifier shared by every node in one logical Kafka cluster; unrelated to Kubernetes cluster identity.
+broker.rack / client.rack	Broker-side value driving replica placement across failure domains; consumer-side value enabling local-replica fetching when it matches.
+CFK	Confluent for Kubernetes — the operator and custom-resource set used to deploy Confluent Platform.
+SCC	OpenShift SecurityContextConstraints — admission control governing pod security-context privileges.
+OpenShift SecurityContextConstraints — admission control governing pod security-context privileges.
