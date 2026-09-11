@@ -29,9 +29,12 @@ if ! openssl version | grep -q "OpenSSL 3\."; then
   exit 1
 fi
 
-NAMESPACE="${NAMESPACE:-confluent}"
 SECRET_NAME="${SECRET_NAME:-kafka-tls}"
+# Context -> namespace pairs. Update these if your kube-context names or
+# per-region namespace names differ from the chart's defaults
+# (values-region-a/b.yaml, values-05dc.yaml).
 CONTEXTS=("region-a" "region-b" "region-05dc")
+NAMESPACES=("kafka-region-a" "kafka-region-b" "kafka-region-05dc")
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -40,10 +43,11 @@ cd "$WORKDIR"
 # SANs must cover EVERY region's internal service DNS and external domain
 # — this one cert has to be valid no matter which region's broker a client
 # connects to, since it's one logical cluster's identity, not three.
-SAN="DNS:kafka.${NAMESPACE}.svc.cluster.local,\
-DNS:*.${NAMESPACE}.svc.cluster.local,\
-DNS:kafka-region-a.example.internal,\
-DNS:kafka-region-b.example.internal"
+SAN=""
+for ns in "${NAMESPACES[@]}"; do
+  SAN="${SAN}DNS:kafka.${ns}.svc.cluster.local,DNS:*.${ns}.svc.cluster.local,"
+done
+SAN="${SAN}DNS:kafka-region-a.example.internal,DNS:kafka-region-b.example.internal"
 
 echo "==> Generating self-signed CA"
 openssl genrsa -out ca-key.pem 4096
@@ -60,17 +64,19 @@ openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem \
   -extfile <(echo "subjectAltName=$SAN")
 
 echo "==> Applying the SAME PEM-format secret to all three region clusters"
-for ctx in "${CONTEXTS[@]}"; do
-  echo "  -> context: $ctx"
+for i in "${!CONTEXTS[@]}"; do
+  ctx="${CONTEXTS[$i]}"
+  ns="${NAMESPACES[$i]}"
+  echo "  -> context: $ctx, namespace: $ns"
   kubectl create secret generic "$SECRET_NAME" \
     --from-file=fullchain.pem=server-cert.pem \
     --from-file=privkey.pem=server-key.pem \
     --from-file=cacerts.pem=ca-cert.pem \
-    -n "$NAMESPACE" --context "$ctx" \
+    -n "$ns" --context "$ctx" \
     --dry-run=client -o yaml | kubectl apply -f - --context "$ctx"
 done
 
-echo "Done. '$SECRET_NAME' (PEM format) is now identical in: ${CONTEXTS[*]}"
+echo "Done. '$SECRET_NAME' (PEM format) is now identical across: ${CONTEXTS[*]}"
 echo "Re-run this script (with the same generated certs saved somewhere"
 echo "safe) any time you rotate — CFK detects the secret change and does"
 echo "a safe one-broker-at-a-time rolling restart automatically."

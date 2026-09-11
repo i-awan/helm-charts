@@ -1,0 +1,22 @@
+{{- if .Values.kafkaRestClass.enabled }}
+apiVersion: platform.confluent.io/v1beta1
+kind: KafkaRestClass
+metadata:
+  name: {{ .Values.kafkaRestClass.name }}
+  namespace: {{ .Values.namespace }}
+spec:
+  kafkaClusterRef:
+    name: {{ .Values.kafka.clusterName }}
+    namespace: {{ .Values.namespace }}
+  {{- if .Values.kafkaRestClass.auth.enabled }}
+  kafkaRest:
+    authentication:
+      type: {{ .Values.kafkaRestClass.auth.type }}
+      {{- if eq .Values.kafkaRestClass.auth.type "bearer" }}
+      bearer:
+        secretRef: {{ .Values.kafkaRestClass.auth.secretRef }}
+      {{- end }}
+    tls:
+      secretRef: {{ .Values.kafkaRestClass.auth.tlsSecretRef }}
+  {{- end }}
+{{- end }}

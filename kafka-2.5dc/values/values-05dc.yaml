@@ -2,6 +2,8 @@
 # one vote to the shared quorum. No Kafka CR is rendered for this region
 # (region.mode=light) — no brokers, no partition data, minimal footprint.
 
+namespace: kafka-region-05dc
+
 region:
   name: region-05dc
   mode: light

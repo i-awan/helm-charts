@@ -1,0 +1,24 @@
+# Overlay for external access to Kafka from OUTSIDE the OpenShift cluster
+# — layer this on top of whichever base values file you're using:
+#
+#   helm upgrade --install kafka-region-a . \
+#     -f values-region-a.yaml -f values-openshift-external.yaml -n kafka-region-a
+#
+# Uses OpenShift Routes with SNI-based passthrough — the platform-native
+# equivalent of the k3s NodePort overlay. CFK creates one bootstrap Route
+# plus one Route per broker; each needs its own real DNS entry pointing
+# at your OpenShift router (CFK does not manage DNS itself).
+
+kafka:
+  externalAccess:
+    enabled: true
+    type: route
+    route:
+      domain: "REPLACE_WITH_YOUR_OPENSHIFT_APPS_DOMAIN"   # e.g. apps.mycluster.example.com
+      brokerPrefix: b          # broker DNS becomes b0.<domain>, b1.<domain>, etc.
+
+# TLS is mandatory here, unlike the k3s NodePort overlay — Routes use
+# SNI (the hostname in the TLS handshake) to pick the right per-broker
+# backend, which structurally requires TLS to work at all.
+tls:
+  enabled: true

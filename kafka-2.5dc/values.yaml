@@ -37,7 +37,7 @@ staticQuorumVoters: []
 # a reliable description of physical placement. Fine for functional
 # testing; not something to leave off for a real production rollout.
 nodeSelector:
-  enabled: true
+  enabled: false
 
 # Identity of THIS region. mode "full" runs brokers + a controller.
 # mode "light" is the 0.5DC: controller only, no Kafka CR is rendered.
@@ -52,6 +52,14 @@ cluster:
   name: kafka
   replicationFactor: 3
   minInsyncReplicas: 2
+
+# Lets a region-a consumer that sets client.rack=region-a on its own
+# config fetch from a local replica instead of always crossing to
+# whichever broker leads the partition. Safe to leave on by default —
+# it's a preference that falls back to normal leader-fetch behavior
+# when no local replica exists, and has no effect at all unless the
+# consuming application sets client.rack itself.
+
 
 # Every region needs distinct, non-overlapping ID ranges — and critically,
 # controller IDs and broker IDs must never overlap EVEN WITHIN THE SAME
@@ -100,11 +108,23 @@ kafka:
       memory: 16Gi
   externalAccess:
     enabled: false
-    type: loadBalancer
-    domain: ""
+    type: loadBalancer   # loadBalancer | nodePort | route (route = OpenShift-native)
+    domain: ""           # used when type: loadBalancer
+    nodePort:
+      nodePortOffset: 30000   # must be 30000-32767
+      host: ""                # k3s VM's real reachable IP/FQDN — used for every advertised listener
+    route:
+      domain: ""              # required when type: route — your OpenShift cluster's apps domain
+      bootstrapPrefix: ""     # optional — defaults exist in CFK if left blank
+      brokerPrefix: ""        # optional — broker DNS becomes <brokerPrefix>0.<domain>, etc.
+      wildcardPolicy: ""      # optional
+  rackAwareFetching:
+    enabled: true
+  clusterName: kafka
+  bootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9071   # internal plaintext listener
 
 tls:
-  enabled: true
+  enabled: false
   secretRef: kafka-tls   # must be the SAME cert material, pre-created in every region's namespace
                           # see scripts/generate-and-distribute-tls.sh
 
@@ -159,3 +179,50 @@ schemaRegistry:
     limits:
       cpu: "500m"
       memory: 1Gi
+
+tls:
+  enabled: false            # matches PLAINTEXT listeners + http admin endpoint
+
+kafkaRestClass:
+  enabled: true
+  name: default
+  auth:
+    enabled: false          # no MDS/RBAC
+
+kafkaRestProxy:
+  enabled: true
+  name: kafkarestproxy
+  replicas: 2
+  kafkaAuth:
+    enabled: false
+
+connect:
+  enabled: true
+  name: connect
+  replicas: 2
+  kafkaAuth:
+    enabled: false
+
+controlCenter:
+  enabled: true
+  name: controlcenter
+  replicas: 1
+  dataVolumeCapacity: 10Gi
+  connectUrl: http://connect.kafka-region-a.svc.cluster.local:8083   # http, not https
+  schemaRegistry:
+    enabled: false
+
+topics:
+  - name: orders
+    enabled: true
+    replicas: 2              # cluster is replicas: 2 / minISR: 2 — see note
+    partitionCount: 6
+    config:
+      retention.ms: "604800000"
+      cleanup.policy: delete
+
+images:
+  init: confluentinc/confluent-init-container:2.11.0
+  kafkaRest: confluentinc/cp-kafka-rest:7.9.0
+  connect: confluentinc/cp-server-connect:7.9.0
+  controlCenter: confluentinc/cp-enterprise-control-center:7.9.0

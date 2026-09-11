@@ -1,0 +1,23 @@
+# Overlay for external access to Kafka from OUTSIDE the k3s cluster —
+# layer this on top of whichever base values file you're using:
+#
+#   helm upgrade --install kafka-test . \
+#     -f values-standalone.yaml -f values-k3s-external.yaml -n confluent
+#
+# Uses NodePort — simplest option for k3s, no Traefik/ingress involved at
+# all. Each broker gets its own raw TCP port directly on the node,
+# starting from nodePortOffset; a client connects to the bootstrap port
+# first, then directly to whichever broker's own port leads the
+# partition it needs — same discovery mechanic as internal traffic.
+
+kafka:
+  externalAccess:
+    enabled: true
+    type: nodePort
+    nodePort:
+      nodePortOffset: 30092   # exposed ports become 30092 (bootstrap), 30093, 30094...
+      host: "REPLACE_WITH_YOUR_K3S_VM_IP"   # e.g. from `multipass info <vm-name>`
+
+# TLS isn't structurally required for nodePort routing to work (no SNI
+# involved, unlike loadBalancer/route) — leave tls.enabled as whatever
+# your base values file already has.

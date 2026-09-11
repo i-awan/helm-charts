@@ -231,6 +231,25 @@ against region-a's broker, successfully decoded via the Avro-aware
 consumer pointed at region-b's broker — real, physical cross-namespace
 replication, not just matching config.
 
+## Rack-aware fetching: keeping consumers local to their region
+
+Producers can never be guaranteed to stay in-region — a producer must
+write to whichever broker currently **leads** the target partition,
+and leadership rotates across all brokers regardless of region to
+spread load. There's no "write to a local follower" option; only the
+leader accepts writes at all.
+
+**Consumers are different — followers hold valid, readable data too.**
+`rackAwareFetching.enabled: true` (default) sets
+`replica.selector.class=RackAwareReplicaSelector` on every broker,
+which lets a consumer that sets `client.rack=<region>` on its *own*
+config fetch from a local replica instead of always crossing to the
+leader. It's a preference, not a guarantee — falls back to the leader
+if no local replica exists — and it only affects consume; produce
+behavior is unaffected either way. The consuming application has to
+set `client.rack` itself; nothing server-side can force this on an
+unconfigured client.
+
 ## `clusterID`: glues the *Kafka* cluster, not the Kubernetes cluster
 
 Two IDs that sound similar but are completely unrelated layers:

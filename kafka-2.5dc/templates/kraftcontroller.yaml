@@ -62,10 +62,10 @@ spec:
       #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}
       topology.kubernetes.io/region: {{ .Values.region.name }}
     {{- end }}
-  {{- if or .Values.authorization.enabled .Values.staticQuorumVoters }}
+  {{- if or .Values.authorization.enabled .Values.kraftController.staticQuorumVoters }}
   configOverrides:
     server:
-      {{- if .Values.staticQuorumVoters }}
+      {{- if .Values.kraftController.staticQuorumVoters }}
       # Static quorum via the raw Kafka property, not CFK's structured
       # `listeners.controllerQuorumVoters` field — that field was
       # rejected as "unknown field" by this cluster's installed CRD
@@ -79,7 +79,7 @@ spec:
       # KRaftController CR, not just a self-reference. Matching
       # clusterID alone does not form one cross-namespace/cross-cluster
       # quorum (confirmed the hard way — see README).
-      - controller.quorum.voters={{ range $i, $v := .Values.staticQuorumVoters }}{{ if $i }},{{ end }}{{ $v.nodeId }}@{{ $v.brokerEndpoint }}{{ end }}
+      - controller.quorum.voters={{ range $i, $v := .Values.kraftController.staticQuorumVoters }}{{ if $i }},{{ end }}{{ $v.nodeId }}@{{ $v.brokerEndpoint }}{{ end }}
       {{- end }}
       {{- if .Values.authorization.enabled }}
       - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer

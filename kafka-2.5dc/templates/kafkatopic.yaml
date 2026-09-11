@@ -1,0 +1,20 @@
+{{- range .Values.topics }}
+{{- if .enabled }}
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: KafkaTopic
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.namespace }}
+spec:
+  replicas: {{ .replicas }}
+  partitionCount: {{ .partitionCount }}
+  {{- with .config }}
+  configs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  kafkaRestClassRef:
+    name: {{ $.Values.kafkaRestClass.name }}
+    namespace: {{ $.Values.namespace }}
+{{- end }}
+{{- end }}

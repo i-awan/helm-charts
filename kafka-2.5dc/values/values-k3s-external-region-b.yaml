@@ -1,0 +1,21 @@
+# NodePort external access for region-b specifically (mock 2.5DC setup).
+# Layer on top of the base region-b values file:
+#
+#   helm upgrade --install kafka-region-b . \
+#     -f values-mock-region-b.yaml -f values-k3s-external-region-b.yaml \
+#     -n kafka-region-b
+#
+# Offset MUST differ from region-a's (30092) — both regions' NodePorts
+# share the same cluster-wide port space on this one k3s cluster, so
+# reusing 30092 here would collide with region-a's bootstrap port.
+#
+# With 1 broker, this creates 2 NodePort Services: bootstrap (30095),
+# broker 210 (30096).
+
+kafka:
+  externalAccess:
+    enabled: true
+    type: nodePort
+    nodePort:
+      nodePortOffset: 30095
+      host: "51.15.210.82"   # same VM IP as region-a's overlay

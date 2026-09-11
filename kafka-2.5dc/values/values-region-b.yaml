@@ -1,3 +1,5 @@
+namespace: kafka-region-b
+
 region:
   name: region-b
   mode: full

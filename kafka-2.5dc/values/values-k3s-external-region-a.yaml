@@ -1,0 +1,17 @@
+# NodePort external access for region-a specifically (mock 2.5DC setup).
+# Layer on top of the base region-a values file:
+#
+#   helm upgrade --install kafka-region-a . \
+#     -f values-mock-region-a.yaml -f values-k3s-external-region-a.yaml \
+#     --set kafka.replicas=2 -n kafka-region-a
+#
+# With 2 brokers, this creates 3 NodePort Services: bootstrap (30092),
+# broker 110 (30093), broker 111 (30094).
+
+kafka:
+  externalAccess:
+    enabled: true
+    type: nodePort
+    nodePort:
+      nodePortOffset: 30092
+      host: "51.15.210.82"   # e.g. from `multipass info <vm-name>`
