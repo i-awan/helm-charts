@@ -1,0 +1,35 @@
+# templates/reassign-job.yaml (sketch)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-reassign-command-topic
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: reassign
+          image: {{ .Values.images.kafka }}     # an image with kafka-reassign-partitions
+          command: ["sh","-c"]
+          args:
+            - |
+              kafka-reassign-partitions \
+                --bootstrap-server {{ .Values.kafka.bootstrapEndpoint }} \
+                --reassignment-json-file /config/reassign.json --execute
+          volumeMounts:
+            - { name: reassign, mountPath: /config }
+      volumes:
+        - name: reassign
+          configMap:
+            name: {{ .Release.Name }}-reassign
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-reassign
+data:
+  reassign.json: |
+    {"version":1,"partitions":[{"topic":"_confluent-command","partition":0,"replicas":[110,210,111]}]}
