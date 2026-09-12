@@ -1,0 +1,2 @@
+oc exec <broker-pod> -n kafka-region-a -- sh -c \
+  'echo "{\"version\":1,\"partitions\":[{\"topic\":\"_confluent-command\",\"partition\":0,\"replicas\":[110,111,210]}]}" > /tmp/reassign.json && cat /tmp/reassign.json'
