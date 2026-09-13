@@ -1,828 +1,409 @@
-# kafka-2.5dc
+# Kafka 2.5 DC Multi-Region Cluster on OpenShift
 
-A Helm chart that renders the CFK (Confluent for Kubernetes) `KRaftController`,
-`Kafka`, `SchemaRegistry`, and `Schema` custom resources needed to run one
-logical Kafka cluster stretched across a **2.5-datacenter (2.5DC) topology**:
-two full regions running brokers and a controller each, plus one lightweight
-witness region running only a KRaft controller.
+A single **stretched KRaft Kafka cluster** (one cluster ID, one controller quorum) spread across three OpenShift namespaces/regions, deployed with **Confluent for Kubernetes (CFK)**.
 
-This document summarizes the reasoning behind the design, not just the
-commands — see the inline `# comments` in each `values-*.yaml` for
-field-level detail.
+It is a **"2.5 DC"** topology: two full data regions plus one controller-only region acting as a quorum tiebreaker — the "0.5".
+
+![2.5 DC architecture](docs/architecture.png)
 
 ---
 
-## Quick start — do these in order
+## Table of contents
 
-Two ways to run this chart, depending on what infrastructure you have.
-**Node labeling is step 1 wherever it appears — do it before installing
-anything, or pods will sit unschedulable with no useful error on the CR
-itself.**
+- [Architecture](#architecture)
+  - [The design in one page](#the-design-in-one-page)
+  - [Key design decisions](#key-design-decisions)
+  - [Node ID scheme](#node-id-scheme)
+- [Durability model](#durability-model)
+  - [RF, ISR, minISR](#rf-isr-minisr)
+  - [Leader loss vs replica loss](#leader-loss-vs-replica-loss)
+  - [Region-failure survival](#region-failure-survival)
+  - [Uneven region loss](#uneven-region-loss)
+  - [Why minISR=1 is wrong](#why-minisr1-is-the-wrong-fix)
+  - [Alternative: RF=5 for two regions](#alternative-rf5-for-two-regions)
+- [Configuration](#configuration)
+  - [Controller quorum (static voters)](#controller-quorum-static-voters)
+  - [Replication-factor defaults](#replication-factor-defaults)
+  - [Cross-region replica placement](#cross-region-replica-placement)
+  - [Endpoints (always FQDN)](#endpoints-always-fqdn)
+- [Cross-region networking](#cross-region-networking)
+- [Deployment](#deployment)
+- [Operations](#operations)
+  - [Reassignment Job](#reassignment-job)
+  - [Troubleshooting runbook](#troubleshooting-runbook)
+- [Recommendations](#recommendations)
 
-| Mode | Values file(s) | Order of operations |
+---
+
+## Architecture
+
+### The design in one page
+
+| Plane | Layout |
+|---|---|
+| **Metadata** | 3 controllers per region × 3 regions = a **9-voter KRaft quorum**. Majority is 5, so metadata survives losing any single region. |
+| **Data** | Brokers in region **A and B only** (region C has none). RF=3 places replicas **2+1** across the two data regions. |
+| **Applications** | Control Center, Schema Registry, Connect, REST Proxy run in **region A only**; topic CRs are managed from region A as cluster-wide objects. |
+| **Networking** | Cross-region traffic must be **explicitly allowed** per namespace; broker, replication, and controller ports carry data and metadata between regions. |
+
+### Key design decisions
+
+| Decision | Why | Trade-off |
 |---|---|---|
-| **Mock 2.5DC** (3 namespaces, 1 real cluster — start here) | `values-mock-region-a/b.yaml`, `values-mock-05dc.yaml` | **0. Reinstall the CFK operator with `namespaced=false` — do this first, or CRs in the new namespaces silently never reconcile** → 1. Label real, distinct nodes per region → 2. `generate-and-distribute-tls-mock.sh` (if using TLS) → 3. install region-a, fetch its `clusterID` → 4. paste into region-b/05dc's values files, install those two — the static voter list fixes quorum *discovery*, but `clusterID` still needs this one manual propagation step |
-| **Real 2.5DC** (3 separate clusters) | `values-region-a/b.yaml`, `values-05dc.yaml` | **1. Label nodes in each cluster** → 2. verify cross-cluster networking prerequisites → 3. CRDs+operator per cluster (into the same namespace as that cluster's workload) → 4. `generate-and-distribute-tls.sh` → 5. install region-a, fetch its `clusterID` → 6. paste into region-b/05dc's values files, install those two |
+| 3-region controller quorum | Metadata survives a full region loss | Metadata commits need a cross-region majority — latency-sensitive |
+| Region C controller-only (the 0.5) | 3rd failure domain for the quorum without paying for a 3rd data copy | Data plane still only spans 2 regions |
+| RF=3, minISR=2 | Standard durability floor; survives a broker failure | On 2 data regions, RF=3 is 2+1 — a region loss makes some partitions read-only |
+| Apps in region A only | Single place to manage C3 / SR / topics | Region A is the app SPOF; those apps must reach brokers in every region |
 
-**The node-labeling command:**
-```bash
-kubectl get nodes   # pick real node names first
-oc label node <node1> topology.kubernetes.io/region=region-a
-oc label node <node2> topology.kubernetes.io/region=region-b
-oc label node <node3> topology.kubernetes.io/region=region-05dc
-```
+### Node ID scheme
 
-**Why this step exists:** two separate mechanisms depend on it —
-`nodeSelector` (Kubernetes-level scheduling onto the right region's
-nodes) and `broker.rack` (Kafka-level replica placement across
-regions). **Caveat confirmed during validation:** `spec.podTemplate.nodeSelector`
-was silently rejected as an unknown field on the CRD version tested —
-see "Cross-namespace/cross-region KRaft quorum" below. Confirm this
-works on your own CFK/CRD version before relying on it for real fault
-isolation; `broker.rack` is unaffected either way, since it's set via a
-config override, not the structured field.
+Each region gets a disjoint ID block via per-region offsets; controllers and brokers occupy non-overlapping ranges. **Every node ID must be globally unique across all regions** — collisions cause quorum and registration failures.
 
-**No privileges to label nodes?** Set `nodeSelector.enabled: false` in
-your values file — skips only the `nodeSelector` requirement and
-switches pod anti-affinity from hard to soft, while keeping everything
-else about that mode intact. Without real node separation, Kubernetes
-is free to schedule a region's pods anywhere, so `broker.rack`'s value
-stops being a reliable description of physical placement — fine for
-proving the chart/config logic, not for production.
+| Region | Controllers (voters) | Brokers (observers) |
+|---|---|---|
+| A — `kafka-region-a` | 100, 101, 102 | 110, 111, 112 |
+| B — `kafka-region-b` | 200, 201, 202 | 210, 211, 212 |
+| C — `kafka-region-05dc` | 300, 301, 302 | _none (controller-only)_ |
+
+> IDs are fixed on disk in `meta.properties` at format time. Changing an offset does **not** renumber a node that already has state — that requires a fresh volume.
 
 ---
 
-## Why 2.5DC, and why "2.5" specifically
+## Durability model
 
-A genuinely stretched Kafka cluster (one logical cluster, not independent
-clusters + async replication) needs its KRaft controllers to reach
-**quorum** — a majority vote — before any metadata change (leader
-election, ISR update, new topic) is considered committed. This is what
-prevents split-brain: two controllers can never simultaneously believe
-they're in charge of the same partition, because two disjoint majority
-groups can never exist out of the same voter set.
+### RF, ISR, minISR
 
-**This is why the controller count must be odd.** With an even number,
-a network partition can split the controllers into two equal halves,
-neither of which has a majority — the cluster freezes even though every
-individual node is healthy. Odd numbers make an even split mathematically
-impossible; there's always a decider.
+- **Replication factor (RF)** — a count of distinct brokers holding each partition. RF can never exceed the brokers available in the placement scope.
+- **ISR** — the set of replicas currently caught up to the leader.
+- **`min.insync.replicas` (minISR)** — the durability floor. With `acks=all`, a write is only acknowledged when at least minISR replicas are in sync; below it, writes are rejected with `NOT_ENOUGH_REPLICAS`.
 
-**This is also why exactly 2 regions can never safely host a stretched
-cluster.** However you split an odd controller count across 2 physical
-locations, one location ends up holding the majority by itself — making
-that specific location a single point of failure for the *entire*
-cluster's control plane. Losing the *other* region is fine; losing the
-majority-holding region halts the cluster even though the surviving
-region is completely healthy. There's no split of controllers across 2
-locations that fixes this — it's a structural property of majority-vote
-systems, not a configuration problem.
+> **minISR does not create replicas — RF does.** minISR only gates writes. Setting `minISR=2` on a topic with 1 replica doesn't add a second; it guarantees that topic can never accept writes.
 
-**2.5DC is the minimal fix:** two full regions (running brokers + a
-controller each) plus one lightweight "0.5" region that runs *only* a
-single tiebreaker controller — no brokers, no partition data, minimal
-footprint. Three physical locations means an odd, evenly-distributable
-quorum: any *one* location can go down and the other two still hold a
-majority. No region is ever a single point of failure.
+The standard pairing is **RF=3 with minISR=2**: lose one replica and keep writing, lose a second and still not lose data.
 
-Confluent's own guidance: use 2.5DC when extremely high availability is
-paramount and the sites are connected by a stable, low-latency network —
-not for sites that are geographically distant or connected by an
-unstable/high-latency link (see "Connectivity requirements" below).
+### Leader loss vs replica loss
 
-## Connectivity required between the three sites
+A partition has one leader, but the leader is **not** a single point of failure — if it dies, a caught-up follower is promoted automatically. What stops writes is the **ISR count falling below minISR**, which depends on how many replicas survive, not on where the leader was. If a region holds a **majority** of a partition's replicas (2 of 3) and goes down, that partition goes read-only regardless of leader location.
 
-All three OpenShift/Kubernetes clusters — including the lightweight 0.5DC
-— need to satisfy CFK's cross-cluster networking prerequisites, since
-Kubernetes has no built-in concept of "these three clusters are one
-Kafka cluster":
+### Region-failure survival
 
-- **Non-overlapping pod CIDRs** across all three clusters
-- **Cross-cluster DNS resolution** — pods in region-a need to resolve and
-  route to pods in region-b and the 0.5DC (and vice versa) for internal
-  listeners
-- **Node labels applied per region** — `topology.kubernetes.io/region=<name>`
-  on every node, which this chart's `nodeSelector` and `broker.rack`
-  config both depend on (see the node-labeling caveat above)
-- **Stable, low latency between region-a and region-b** — this is the
-  link that carries actual partition replication traffic, and it's the
-  most latency-sensitive part of the whole design. Confluent's guidance
-  is explicit that 2.5DC isn't meant for distant/high-latency sites.
-- **Reachability to the 0.5DC** — lighter requirement than the region-a
-  ↔ region-b link, since it only carries controller/quorum traffic, not
-  partition replication, but it still needs to be reliably reachable —
-  an unreachable tiebreaker is as good as no tiebreaker.
+Three replicas can't split evenly across two regions — the split is **2 + 1**. Lose the region holding 2 and only 1 survives (below minISR → read-only). With three regions the split is **1 + 1 + 1**, so any single region can be lost while two in-sync replicas remain.
 
-**Note:** the mock (namespace-based) setup below sidesteps all of the
-above, since one Kubernetes cluster's networking is already flat and
-non-overlapping by definition. It validates everything Kafka-level in
-this document; it does **not** validate any of the bullets above — that
-only happens on the real 3-cluster rollout.
+![Region-failure behaviour: 2 vs 3 regions](docs/region-failure.png)
 
-## Cross-namespace/cross-region KRaft quorum: the real bootstrapping requirement
+| Layout | Replicas / region | Left after region loss | Writes survive? |
+|---|---|---|---|
+| **3 brokers × 2 regions (this cluster)** | 2 + 1 | 1 | ❌ No |
+| 1 broker × 3 regions | 1 + 1 + 1 | 2 | ✅ Yes |
+| 3 brokers × 3 regions (rack-aware) | 1 + 1 + 1 | 2 | ✅ Yes |
 
-This is the single most important finding from building this chart —
-read this before doing a real install.
+> Survival is a function of **failure domains (regions)**, not broker count. This cluster's 6 brokers over 2 regions tolerate a broker failure but **not** a full data-region loss.
 
-**Matching `cluster.clusterID` across regions is NOT sufficient to form
-one quorum.** It's a necessary label, but nowhere close to sufficient.
-Proof, captured live on a real cluster:
+### Uneven region loss
+
+Impact is per-partition: which region holds a partition's 2-replica majority varies, so a region loss leaves **roughly half the partitions writable and half read-only** — a patchy outage. A single topic can be simultaneously up and down; with keyed partitioning, some keys' writes fail deterministically. Three regions removes this: every partition keeps 2 in-sync replicas, so the failure mode is uniform.
+
+### Why minISR=1 is the wrong fix
+
+`min.insync.replicas=1` stops write-blocking but trades away durability **permanently, during stable operation** — not just during an outage. A write can be acked on the leader alone; if it then crashes before a follower copies it, the acknowledged write is silently lost. It also makes routine rolling restarts risky (no floor) and masks single-copy degradation.
+
+Reserve minISR=1 for loss-tolerant data (replayable logs, metrics), set **per-topic, never as the cluster default** — the default would weaken internal topics like `_schemas` and `__consumer_offsets` too.
+
+### Alternative: RF=5 for two regions
+
+If a third **data** region isn't available, **RF=5 across two regions** is the one arrangement that survives a region loss within two regions. Five replicas split 3+2, so the worst case (losing the 3-replica region) still leaves 2 — exactly minISR.
+
+- Requires **rack-aware 3+2 placement** (else it may land 4+1 or 5+0).
+- Needs ≥5 brokers (aim for 6, as 3+3).
+- Caps you at minISR=2; costs 5× storage.
+
+| Aspect | RF=5 across 2 regions | RF=3 across 3 regions |
+|---|---|---|
+| Data regions needed | 2 (existing) | 3 (new broker region) |
+| Copies / storage | 5× (higher) | 3× (lower) |
+| Acks in degraded case | minority (2 of 5) | majority (2 of 3) |
+| Survives a region loss | Yes (3+2 rack placement) | Yes (1+1+1) |
+
+---
+
+## Configuration
+
+### Controller quorum (static voters)
+
+With 3 controllers per region, the static voter list has **9 entries** — all controllers, on the controller listener (9074), identical in every region. Brokers are never listed.
+
+```
+controller.quorum.voters=100@<a-ctrl-0>:9074,101@<a-ctrl-1>:9074, ... ,302@<c-ctrl-2>:9074
+```
+
+Each endpoint is the controller pod's stable StatefulSet FQDN:
+
+```
+kraftcontroller-<region>-<ordinal>.kraftcontroller-<region>.<namespace>.svc.cluster.local:9074
+```
+
+Verify:
 
 ```bash
-kubectl exec -it kraftcontroller-region-a-0 -n kafka-region-a -- \
-  kafka-metadata-quorum --bootstrap-controller localhost:9074 describe --status
+oc exec <broker-pod> -n kafka-region-a -- \
+  kafka-metadata-quorum --bootstrap-server localhost:9071 describe --status
+# CurrentVoters must list all 9 IDs with one leader; observers list the brokers
 ```
-Before the fix below, this showed **only region-a's own controller** as
-a voter, and region-a's own two brokers as observers — region-b's and
-the 0.5DC's controllers and brokers didn't appear at all, not even as
-non-voting observers. Three `KRaftController` CRs sharing one `clusterID`
-string were, in practice, three completely isolated single-node quorums
-that happened to agree on a label.
 
-**Why:** nothing was telling any controller *where* the others actually
-live on the network. `clusterID` is just an identity check performed
-once two controllers already talk to each other — it was never a
-discovery mechanism.
+### Replication-factor defaults
 
-**The fix — an explicit static quorum voter list, identical on every
-region:**
-```yaml
-staticQuorumVoters:
-  - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
-    nodeId: 100
-  - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
-    nodeId: 200
-  - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
-    nodeId: 300
-```
-This same list — every controller, every region — must be set
-identically in every region's values file, not just a self-reference.
-It's already wired into `values-mock-region-a/b.yaml` and
-`values-mock-05dc.yaml`. For a real 3-cluster rollout, swap the internal
-per-namespace DNS names above for whatever externally-reachable
-addresses each region's controller advertises across the cluster
-boundary.
+RF for internal topics is set **per-component at creation time** — they do not inherit `default.replication.factor`, and existing topics keep their creation-time RF. Set these **before first boot**.
 
-**A second, independent gotcha found while fixing the first one: CRD
-schema version mismatch.** CFK's own structured field for this
-(`spec.listeners.controllerQuorumVoters`, per Confluent's current docs)
-was silently rejected as `unknown field` by this cluster's installed CRD
-version — the value never took effect at all, with no hard error, just
-a warning easy to miss. Two other structured fields hit the exact same
-silent-rejection pattern: `spec.podTemplate.initContainers` (a
-Schema Registry startup-ordering nicety — cosmetic, not blocking) and
-`spec.podTemplate.nodeSelector` (node-label-based pod scheduling doesn't
-currently work on this CRD version regardless of the `nodeSelector.enabled`
-setting).
+**Kafka CR (`configOverrides.server`):**
 
-**The working fix bypasses the broken structured field entirely**, using
-`configOverrides.server` — the same raw-Kafka-property passthrough
-mechanism already used for ACL settings, which isn't subject to CRD
-schema validation the same way:
 ```yaml
 configOverrides:
   server:
-    - controller.quorum.voters=100@kraftcontroller-region-a-0...:9074,200@kraftcontroller-region-b-0...:9074,300@kraftcontroller-region-05dc-0...:9074
-```
-This is what `templates/kraftcontroller.yaml` actually renders — built
-automatically from `staticQuorumVoters` via a Helm range, not something
-you write by hand.
-
-**Practical implication for every install you run:** always check
-`helm install`/`upgrade` output for `Warning: unknown field` lines. A
-structured CR field silently doing nothing is far more dangerous than an
-outright error — the install "succeeds," the pod runs, and the actual
-behavior you configured simply never happens. When in doubt, prefer
-`configOverrides` (raw properties) over a newer structured field if
-you're unsure your installed CRD version supports it.
-
-**A quorum-topology change like this is not safe to apply in place** on
-a cluster that already has committed metadata — a controller that
-already bootstrapped itself as a lone voter doesn't cleanly reconcile
-into a multi-voter static list via a config change alone. If you're
-retrofitting this onto an existing cluster, do a clean wipe (`helm
-uninstall` + delete PVCs across all regions) and reinstall fresh with
-the static voter list already in place from the start, rather than
-patching it into a running cluster.
-
-**The static voter list fixes quorum *discovery*, not `clusterID`
-propagation — those remain two separate steps.** Even with the voter
-list in place, region-a still has to be installed first (its
-`KRaftController` generates the shared `clusterID` on first boot), then
-that value fetched and pasted into region-b's and the 0.5DC's values
-files before installing those two — see "Deploying: mock 2.5DC" below
-for the exact commands. Leaving `clusterID` blank on all three and
-installing simultaneously would let each generate its own independent
-random UUID, and a controller refuses to join a quorum whose
-`clusterID` doesn't match its own already-formatted storage — a
-different failure mode than the quorum-discovery problem this section
-is otherwise about, but one that would block the cluster from forming
-just as effectively.
-
-**Confirmed working, end to end, after the fix:**
-```
-CurrentVoters: [{id:100,...}, {id:200,...}, {id:300,...}]   # all three
-CurrentObservers: [{id:210,...}, {id:110,...}, {id:111,...}]  # all brokers, cluster-wide
-```
-Followed by: a 3-partition, RF=3, `min.insync.replicas=2` topic created
-successfully across all 3 brokers; every partition's `Replicas:` showing
-`110,111,210`; and a record produced via `kafka-avro-console-producer`
-against region-a's broker, successfully decoded via the Avro-aware
-consumer pointed at region-b's broker — real, physical cross-namespace
-replication, not just matching config.
-
-## Rack-aware fetching: keeping consumers local to their region
-
-Producers can never be guaranteed to stay in-region — a producer must
-write to whichever broker currently **leads** the target partition,
-and leadership rotates across all brokers regardless of region to
-spread load. There's no "write to a local follower" option; only the
-leader accepts writes at all.
-
-**Consumers are different — followers hold valid, readable data too.**
-`rackAwareFetching.enabled: true` (default) sets
-`replica.selector.class=RackAwareReplicaSelector` on every broker,
-which lets a consumer that sets `client.rack=<region>` on its *own*
-config fetch from a local replica instead of always crossing to the
-leader. It's a preference, not a guarantee — falls back to the leader
-if no local replica exists — and it only affects consume; produce
-behavior is unaffected either way. The consuming application has to
-set `client.rack` itself; nothing server-side can force this on an
-unconfigured client.
-
-## `clusterID`: glues the *Kafka* cluster, not the Kubernetes cluster
-
-Two IDs that sound similar but are completely unrelated layers:
-
-- **Kafka `clusterID`** — one UUID shared by every controller and broker
-  that considers itself part of the same logical Kafka cluster. As
-  established above, this alone does **not** form the quorum — it's a
-  necessary identity check, layered on top of the static voter list.
-- **Kubernetes cluster identity** (e.g. a k3s/OpenShift cluster) — a
-  completely separate concept with no relationship to the above. You
-  could tear down the underlying Kubernetes cluster entirely, reattach
-  the same PVCs to a fresh one, and — as far as Kafka is concerned —
-  it's still "the same" cluster, because the `clusterID` (and the
-  metadata log on those PVCs) never changed. Kubernetes has no
-  comparable single "cluster ID" and Kafka has no awareness Kubernetes
-  exists.
-
-Separately, every controller/broker also needs its own unique **node
-ID** (`controllerIdOffset` / `brokerIdOffset`) — the opposite
-requirement from `clusterID`: this must be *different* everywhere, never
-shared, and critically must never overlap between controllers and
-brokers even within the same region (CFK enforces a hard minimum of 100
-on controller offsets specifically, to keep the ranges apart). See the
-offset table in `values.yaml`.
-
-## TLS / mTLS
-
-`tls.enabled: true` turns on encryption for **every** connection type in
-the cluster via one shared secret (`kafka-tls`), for producer/consumer →
-broker, broker → broker (replication), broker → controller, and
-controller → controller (the Raft quorum traffic itself).
-
-**Secret format: PEM, not JKS/PKCS12** — `fullchain.pem` / `privkey.pem`
-/ `cacerts.pem`. CFK supports both formats and auto-detects which one a
-secret uses based on which keys are present; this chart's scripts
-deliberately use PEM. Reason: building a JKS/PKCS12 keystore requires an
-extra conversion step (`openssl pkcs12 -export`), and OpenSSL 3.x's
-default PKCS12 encryption is frequently unreadable by Java's own keystore
-provider — surfaces at Kafka startup as
-`InvalidAlgorithmParameterException: the trustAnchors parameter must be
-non-empty`, since Java silently loads zero certs from a keystore it
-can't actually parse. Plain PEM certs have no such compatibility layer
-to get wrong, and need no password at all.
-
-**Because it's one logical cluster, the same cert material must exist in
-all three regions' namespaces** — `scripts/generate-and-distribute-tls-mock.sh`
-(3 namespaces, 1 cluster) or `scripts/generate-and-distribute-tls.sh` (3
-real clusters) generates a single self-signed CA + cert (with SANs
-covering every region's endpoints, and `-not_before`/`-not_after` set
-explicitly to avoid clock-skew "not yet valid" failures) and applies the
-identical secret everywhere in one run. Swap the generation step for
-your real PKI in production; the "same secret everywhere" distribution
-requirement stays the same either way. Both scripts require OpenSSL 3.x
-— macOS's bundled `/usr/bin/openssl` is LibreSSL and will fail the
-version check; install real OpenSSL via `brew install openssl@3`.
-
-**What this setup currently does *not* give you: client authentication.**
-TLS as configured here proves *the server's* identity to the client (and
-encrypts the traffic) — it does not by itself prove *the client's*
-identity to the broker. That distinction matters directly for
-`authorization.enabled` (simple ACLs): ACL grants are tied to a
-`User:<principal>` identity, and without some form of client
-authentication — mutual TLS (client certificates) or SASL — Kafka has no
-real way to know which principal is connecting. Enabling ACLs without
-also wiring up mTLS or SASL means every client effectively presents the
-same anonymous/default identity, which defeats the purpose of the ACL
-layer. Adding real mTLS (distinct client certs per principal,
-`ssl.client.auth=required` on the listener) or SASL is the natural next
-step before relying on the authorization block for anything real.
-
-**Both TLS and authorization are commonly parked (`false`/`false`)
-during initial mechanics validation** — see the mock values files — to
-isolate quorum/replication testing from security-layer variables. Turn
-both back on once the multi-region mechanics are proven; nothing about
-re-enabling them depends on anything else in this document.
-
-## Deploying: mock 2.5DC (3 namespaces, 1 real cluster)
-
-The cheapest way to validate the real quorum/replication mechanics
-before touching multi-cluster infrastructure.
-
-### 0. CFK operator must watch all three namespaces
-
-By default CFK installs with `namespaced: true`, reconciling only the
-namespace it was installed into. Fix:
-```bash
-helm upgrade --install cfk-operator confluentinc/confluent-for-kubernetes \
-  --set namespaced=false -n confluent
-kubectl delete pod -n confluent -l app=confluent-operator   # restart to pick up the change
+    - default.replication.factor=3
+    - offsets.topic.replication.factor=3
+    - transaction.state.log.replication.factor=3
+    - confluent.license.topic.replication.factor=3
+    - min.insync.replicas=2
 ```
 
-### 1. Label real, distinct nodes per mocked region
+**SchemaRegistry CR:**
+
+```yaml
+configOverrides:
+  server:
+    - kafkastore.topic.replication.factor=3
+```
+
+**ControlCenter CR** (note: C3 uses `.replication`, **not** `.replication.factor`):
+
+```yaml
+configOverrides:
+  server:
+    - confluent.controlcenter.internal.topics.replication=3
+    - confluent.controlcenter.command.topic.replication=3
+    - confluent.monitoring.interceptor.topic.replication=3
+    - confluent.metrics.topic.replication=3
+```
+
+### Cross-region replica placement
+
+RF sets how many replicas exist; it does **not** control *where* they land. Without region awareness, Kafka assigns replicas by broker-ID order. Because region-A IDs (110–112) sort before region-B (210–212), RF=3 lands **2 replicas in A + 1 in B on every partition** — uniformly. This is dangerous:
+
+- Lose region A → *every* partition drops to 1 replica → **the whole cluster goes read-only** (not "half").
+- Leadership also concentrates in region A.
+
+**Preferred fix — `broker.rack` via config** (node-free; makes placement region-aware and automatic at creation time):
+
+```yaml
+# region-a Kafka CR
+configOverrides:
+  server:
+    - broker.rack=region-a
+# region-b Kafka CR
+configOverrides:
+  server:
+    - broker.rack=region-b
+```
+
+> ⚠️ **Version-dependent** — some CFK versions manage `broker.rack` themselves and may override a manual value. Verify it took:
+> ```bash
+> oc exec <broker> -n <ns> -- grep broker.rack /opt/confluentinc/etc/kafka/kafka.properties
+> ```
+
+The label-based `rackAssignment.nodeLabels` mechanism reads a **node label** and needs node RBAC + labelled nodes — **not available** in this environment.
+
+| | `broker.rack` (config) | [Reassignment Job](#reassignment-job) |
+|---|---|---|
+| Fixes existing topics | ❌ No | ✅ Yes |
+| Fixes future topics | ✅ **Yes, automatically** | ❌ No (re-run per topic) |
+| Needs node access | No | No |
+| Availability | Version-dependent (verify) | Works everywhere |
+| Effort | One-time config + rolling restart | Recurring |
+
+**Recommended combination:** use `broker.rack` (if honoured) so future topics balance automatically, and run the reassignment Job **once** to fix already-clumped existing topics, then retire it.
+
+Caveats: rack awareness does not retroactively move existing topics; `broker.rack` is immutable once set (needs a rolling restart); it still can't beat the two-region math (RF=3 over 2 racks is 2+1). After reassigning, run a preferred-leader election so leadership balances:
 
 ```bash
-oc label node <node1> topology.kubernetes.io/region=region-a
-oc label node <node2> topology.kubernetes.io/region=region-b
-oc label node <node3> topology.kubernetes.io/region=region-05dc
+kafka-leader-election --bootstrap-server localhost:9071 \
+  --election-type preferred --all-topic-partitions
 ```
 
-### 2. CRDs (once per cluster)
+### Endpoints (always FQDN)
+
+Every component's `bootstrapEndpoint` and C3's `connectUrl` must use the fully-qualified form, never a bare `kafka:9071`:
+
+```
+kafka.<namespace>.svc.cluster.local:9071
+```
+
+A bare name resolves in the **caller's** namespace, so it silently points at the wrong cluster (or fails) from another region. This cluster is **plaintext** — endpoints are `http://` / port 9071, TLS off.
+
+---
+
+## Cross-region networking
+
+**The most important operational lesson.** On a stretched cluster, brokers, controllers, and components must reach each other **across namespaces**. NetworkPolicy is **default-deny per namespace**, so each destination namespace needs its own ingress rule. A policy that allows only the external client port (9092) lets the cluster form at the metadata level but **blocks data replication between regions** — surfacing as misleading license, placement, and registration errors.
+
+**Metadata plane vs. data plane** — membership and data access travel on different ports and fail independently. A controller quorum showing another region's brokers as members (`describe --status`) proves membership, **not** that a broker there can read topic data. That fetch is a separate connection to the partition leader on the broker/replication listener.
+
+### Ports to allow cross-namespace
+
+| Port | Purpose | Cross-namespace |
+|---|---|---|
+| **9071** | Internal broker listener — inter-broker replication & data fetch | ✅ Required (both directions) |
+| **9072** | Replication listener | ✅ Required (both directions) |
+| **9074** | Controller listener (KRaft quorum) | ✅ Required (all regions) |
+| 9092 | External client listener | ⚠️ Insufficient alone |
+
+Also open **component → broker** paths: Control Center and Schema Registry live in region A but manage/read the whole cluster, so they must reach brokers in **every** region. Because policy is per destination namespace, allowing them into region B requires a rule in **region B's** namespace — scope it to the whole region-A namespace (not just the C3 pod) so Schema Registry is covered when a `_schemas` leader lands in region B.
+
+**Verify** (works even if brokers crash-loop — run from a throwaway pod):
 
 ```bash
-helm repo add confluentinc https://packages.confluent.io/helm
-helm repo update
-helm pull confluentinc/confluent-for-kubernetes --untar
-kubectl apply --server-side -f confluent-for-kubernetes/crds/
-kubectl get crd | grep platform.confluent.io   # confirm
+oc run nettest -n kafka-region-b --image=registry.access.redhat.com/ubi9/ubi-minimal \
+  --restart=Never --rm -it -- \
+  sh -c 'for p in 9071 9072 9074; do timeout 3 bash -c "</dev/tcp/kafka.kafka-region-a.svc.cluster.local/$p" && echo "$p OPEN" || echo "$p BLOCKED"; done'
 ```
 
-### 3. TLS (only if `tls.enabled: true` in your values)
+> Keep these NetworkPolicies in the Helm chart / IaC — a namespace rebuild otherwise reintroduces the client-port-only rule. NetworkPolicies are a security control; widening them is the platform team's call.
 
-No password needed — this script uses PEM, not JKS/PKCS12:
-```bash
-./scripts/generate-and-distribute-tls-mock.sh
+Example (region-a namespace, allowing inter-broker + controller traffic from B and C):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cross-region-kafka
+  namespace: kafka-region-a
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kafka-region-b } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kafka-region-05dc } }
+      ports:
+        - { protocol: TCP, port: 9071 }
+        - { protocol: TCP, port: 9072 }
+        - { protocol: TCP, port: 9074 }
 ```
 
-### 4. Bootstrap region-a first, then capture and propagate its clusterID
+Apply reciprocal policies in **every** region namespace.
 
-The static voter list solves *quorum discovery* (who's in the cluster),
-but every controller still needs to agree on the same `clusterID` (an
-explicit identity check, separate from discovery) — leaving it blank on
-all three would let each generate its own random UUID independently, and
-a controller refuses to join a quorum whose `clusterID` doesn't match
-its own already-formatted storage. So this part still isn't fully
-simultaneous, even with the static voter list in place:
+---
 
-```bash
-helm install kafka-region-a . -f values-mock-region-a.yaml -n kafka-region-a
-kubectl get pods -n kafka-region-a -w   # wait for kraftcontroller-region-a-0 to reach 1/1
-```
+## Deployment
 
-Fetch the generated `clusterID`:
-```bash
-kubectl get kraftcontroller kraftcontroller-region-a -n kafka-region-a \
-  -o jsonpath='{.status.clusterID}'
-```
-
-Paste that value into `cluster.clusterID` in **both**
-`values-mock-region-b.yaml` and `values-mock-05dc.yaml`, replacing the
-`REPLACE_WITH_CLUSTER_ID_FROM_REGION_A` placeholder, then install the
-remaining two:
-```bash
-helm install kafka-region-b . -f values-mock-region-b.yaml -n kafka-region-b
-helm install kafka-05dc . -f values-mock-05dc.yaml -n kafka-region-05dc
-```
-
-### 5. Verify the quorum actually formed
+Region A is installed first to mint the cluster ID, which is then supplied to the other regions.
 
 ```bash
-kubectl exec -it kraftcontroller-region-a-0 -n kafka-region-a -- \
-  kafka-metadata-quorum --bootstrap-controller localhost:9074 describe --status
-```
-`CurrentVoters` should list all three node IDs (`100`, `200`, `300`).
+# 1. RBAC / NetworkPolicies per namespace (apply first)
+oc apply -f networkpolicy-region-a.yaml
+oc apply -f networkpolicy-region-b.yaml
+oc apply -f networkpolicy-region-05dc.yaml
 
-### 6. Prove real cross-region replication — create the topic
+# 2. Region A (mints cluster ID)
+helm upgrade --install <release> -n kafka-region-a \
+  -f values-common.yaml -f values-region-a.yaml
+
+# 3. Regions B and C with the shared cluster ID
+helm upgrade --install <release> -n kafka-region-b \
+  -f values-common.yaml -f values-region-b.yaml
+helm upgrade --install <release> -n kafka-region-05dc \
+  -f values-common.yaml -f values-region-05dc.yaml
+```
+
+> Because region A is up first, internal topics are initially created with all replicas in region A. See [Cross-region replica placement](#cross-region-replica-placement) and the [Reassignment Job](#reassignment-job) to balance them 2+1.
+
+**Post-deploy verification:**
 
 ```bash
-kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
-  --bootstrap-server localhost:9092 \
-  --create --topic orders3 --partitions 3 --replication-factor 3 \
-  --config min.insync.replicas=2
+# all 6 brokers registered, quorum healthy (9 voters)
+oc exec <broker-pod> -n kafka-region-a -- \
+  kafka-metadata-quorum --bootstrap-server localhost:9071 describe --status
 
-kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
-  --bootstrap-server localhost:9092 --describe --topic orders3
-```
-Every partition's `Replicas:` should include brokers from **both**
-region-a and region-b.
+# broker.rack set per region (if using the config path)
+oc exec <broker-pod> -n kafka-region-a -- grep broker.rack /opt/confluentinc/etc/kafka/kafka.properties
+oc exec <broker-pod> -n kafka-region-b -- grep broker.rack /opt/confluentinc/etc/kafka/kafka.properties
 
-### 7. The valuable test: produce in region-a, consume in region-b
-
-This is the test that actually proves cross-region replication is
-physically real, not just correct on paper — a same-region test could
-pass even on a broken, effectively single-region deployment.
-
-**Produce, against region-a's broker:**
-```bash
-kubectl exec -it kafka-0 -n kafka-region-a -- kafka-console-producer \
-  --bootstrap-server localhost:9092 --topic orders3
-```
-Type a record, then **`Ctrl+D`** (not `Ctrl+C` — a hard kill can skip
-flushing the record before the process exits):
-```
-order-847 created
+# internal topics spread across both regions
+for t in _confluent-command _schemas __consumer_offsets; do
+  oc exec <broker-pod> -n kafka-region-a -- \
+    kafka-topics --bootstrap-server localhost:9071 --describe --topic $t
+done
 ```
 
-**Consume, against region-b's broker — a different namespace, a
-different broker, that never received the write directly:**
-```bash
-kubectl exec -it kafka-0 -n kafka-region-b -- kafka-console-consumer \
-  --bootstrap-server kafka.kafka-region-b.svc.cluster.local:9092 \
-  --topic orders3 --from-beginning
-```
-If the record shows up here, that's real, physical confirmation the
-record's bytes replicated across the namespace boundary — see the
-Schema Registry walkthrough below for the Avro-aware version of this
-same test, with a fuller explanation of exactly what it proves.
+---
 
-### 8. The schema-file convention — how `payment-schema.yaml` was authored
+## Operations
 
-`schemas/payment/payment-schema.yaml` already ships with this chart
-(that's why step 9 below needs no registration step) — this is the
-convention used to author it, useful when you want to add your own
-schema alongside it. The file lives inside the chart directory itself;
-`templates/schemas.yaml` discovers anything matching this pattern
-automatically via `.Files.Glob "schemas/**/*.yaml"`. It isn't a
-Kubernetes object at this point, just a file on disk:
+### Reassignment Job
 
-```bash
-mkdir -p schemas/shipments
-cat > schemas/shipments/shipments-schema.yaml << 'EOF'
-name: shipments
-subjects: shipments-value
-format: avro
-schema: |
-  {
-    "type": "record",
-    "name": "Shipment",
-    "namespace": "io.example.shipments",
-    "fields": [
-      { "name": "shipment_id", "type": "string" },
-      { "name": "order_id", "type": "string" },
-      { "name": "status", "type": "string" }
-    ]
-  }
-EOF
+A Helm **post-upgrade** hook that re-places internal topics **2+1 across the two data regions**, generating the assignment per-partition (not hardcoded JSON) and alternating the majority region for balance. See [`reassign-internal-topics-job.yaml`](reassign-internal-topics-job.yaml).
+
+Values it reads:
+
+```yaml
+reassign:
+  regionABrokers: [110, 111, 112]
+  regionBBrokers: [210, 211, 212]
+  throttleBytesPerSec: "50000000"   # 50 MB/s inter-broker throttle
+  topics:
+    - _confluent-command
+    - _schemas
+    - __consumer_offsets
+    - __transaction_state
+    - _confluent-monitoring
+    - _confluent-metrics
+    - connect-configs
+    - connect-offsets
+    - connect-status
 ```
 
-Dropping in a file like this and running `helm upgrade` gets it
-rendered and registered automatically — no template changes needed. The
-next step shows exactly what that rendering and registration produced
-for the `payment` schema already bundled with the chart.
+**Reassign vs. recreate** — some internal topics hold irreplaceable state and must be reassigned, never deleted:
 
-### 9. Schema Registry was already populated — no `helm upgrade` needed
+| Topic | Holds real state? | Action |
+|---|---|---|
+| `_schemas` | Yes (schemas) | **Reassign** — never delete |
+| `__consumer_offsets` | Yes (offsets) | **Reassign** — never delete |
+| `__transaction_state` | Yes (txn state) | Reassign if EOS/txns used |
+| `connect-offsets` | Yes (connector offsets) | **Reassign** |
+| `connect-configs` / `connect-status` | Configs/status | Reassign (or recreate if empty) |
+| `_confluent-command` | Regenerable | Either |
+| `_confluent-monitoring` / `-metrics` | Regenerable | Recreate or reassign |
 
-Unlike the from-scratch walkthrough later in this document, nothing
-extra needs installing here. `schemas/payment/payment-schema.yaml`
-ships with this chart, and `schemaRegistry.enabled`/`schemas.enabled`
-both default to `true` — so the moment `helm install` ran in step 4,
-the `payment` schema was already rendered and registered. Confirm it:
+> - **Post-upgrade only** — topics must already exist; never runs on a fresh install.
+> - **Throttled** (default 50 MB/s) because moving `__consumer_offsets` / `__transaction_state` (50 partitions each) shifts real data. Re-run `--verify` later to clear the throttle.
+> - It is an **imperative repair**. The permanent fix is [`broker.rack`](#cross-region-replica-placement) + RF defaults so topics are born correct.
 
-```bash
-kubectl exec -it schemaregistry-0 -n kafka-region-a -- \
-  curl -s http://localhost:8081/subjects/payment-value/versions/latest
-```
-This should already return a registered schema — nothing to create.
+### Troubleshooting runbook
 
-**What actually happened under the hood, back at step 4, worth being
-explicit about:**
+> Recurring meta-lesson: **suspect stale on-disk node state or the cross-region network path before the Kafka config.**
 
-1. **`templates/schemas.yaml`** found `schemas/payment/payment-schema.yaml`
-   inside the chart (via `.Files.Glob "schemas/**/*.yaml"`) and rendered
-   two Kubernetes objects from it: a `ConfigMap` named
-   `payment-schema-config` (holding the raw Avro JSON as plain text —
-   Kubernetes doesn't parse or validate it, it's just inert data at this
-   point) and a `Schema` custom resource named `payment` (holding
-   `spec.name: payment-value`, `spec.data.format: avro`, and a reference
-   to that ConfigMap).
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `INCONSISTENT_CLUSTER_ID` (104) on fetch/vote | Node booted on a stale volume with a different cluster ID, or cluster ID not shared across regions | Ensure the same cluster ID across regions; clear the odd node's PVC so it reformats |
+| Node ID appears as both voter and observer | Identical ID offsets across regions, or stale `meta.properties` | Disjoint per-region offsets; clear stale volumes so nodes reformat under new IDs |
+| Controller: *"node 201 must be in the set of voters"* | Scaled controllers to 3/region but static voter list still had 1/region | List all 9 controllers in `controller.quorum.voters`, identical in every region |
+| Control Center: *"failed to get bootstrap cluster id"* | Bare `bootstrapEndpoint` (`kafka:9071`) resolved wrong from its namespace | Use FQDN `kafka.<ns>.svc.cluster.local:9071` |
+| Schema Registry: *"failed to write Noop record"* | `_schemas` ISR < minISR (too few brokers / clumped replicas) | Ensure enough brokers; RF=3 with a replica in each region |
+| Broker: *"valid license must be configured"* (region B) | Brokers can't read `_confluent-command` — replicas all in A **and** 9071 blocked cross-region | Open 9071/9072 cross-region; reassign the topic to include a region-B broker |
+| Reassign: *"unknown broker 210"* | Target broker crash-looping → not a registered/eligible target | Fix the crash first (networking) so the broker stays up, then reassign |
+| Internal topic has all replicas in region A | Topic created while only region-A brokers existed (A installed first) | Reassign 2+1 once all brokers healthy; set RF defaults before creation |
+| Every topic uniformly 2-in-A / 1-in-B | No region awareness — replicas placed by broker-ID order; losing A makes the whole cluster read-only | Set `broker.rack` per region; reassign existing topics to alternating 2+1 + preferred-leader election |
+| Init container `ErrImagePull`: certificate expired/not yet valid | Node clock skew (TLS cert validation fails) | Fix node time sync (chrony/NTP) — a node/infra action, not a Kafka change |
 
-   Concretely, this is the actual `ConfigMap` that got created in
-   `kafka-region-a` during step 4 — confirm it yourself with
-   `kubectl get configmap payment-schema-config -n kafka-region-a -o yaml`:
-   ```yaml
-   apiVersion: v1
-   kind: ConfigMap
-   metadata:
-     name: payment-schema-config
-     namespace: kafka-region-a
-   data:
-     schema: |
-       {
-         "type": "record",
-         "name": "Payment",
-         "namespace": "io.example.payment",
-         "fields": [
-           { "name": "payment_id", "type": "string" },
-           { "name": "order_id", "type": "string" },
-           { "name": "amount", "type": "double" },
-           { "name": "status", "type": "string" }
-         ]
-       }
-   ```
-   Notice this is just your `schemas/payment/payment-schema.yaml`
-   file's `schema:` block, copied verbatim into a Kubernetes object —
-   nothing added, nothing transformed. The `Schema` CR (below) is the
-   part that actually turns this inert text into a real registration.
-2. **The CFK operator**, watching for `Schema` CRs, picked this one up,
-   read the referenced ConfigMap's content, and made a real REST call —
-   `POST /subjects/payment-value/versions` — against the `SchemaRegistry`
-   instance this same chart install had just stood up.
-3. **Schema Registry** validated the schema, assigned it a version and a
-   globally unique schema ID, and durably persisted that registration as
-   an actual Kafka record in its internal `_schemas` compacted topic —
-   on the same underlying Kafka cluster, not a separate store.
-4. **The operator wrote the result back** into the `Schema` CR's
-   `.status` field — which is exactly what the `kubectl get schema
-   payment -n kafka-region-a -o yaml` command would show you, if you
-   want to see the registered version/ID reflected there too.
+---
 
-None of this required a topic to exist, a producer to run, or any
-manual `curl`/CLI step — it's the same declarative, operator-reconciled
-pattern as the `Kafka` and `KRaftController` CRs themselves, just aimed
-at Schema Registry's REST API instead of the Kafka Admin API.
+## Recommendations
 
-### 10. Produce via region-a, consume via region-b — using the bundled schema
+- Keep **RF=3 / minISR=2** as the durability standard; set the internal-topic RF defaults **before first boot**.
+- Bake the **cross-region NetworkPolicies into IaC** (9071/9072/9074 both directions, all region pairs, plus component→broker) so a rebuild can't reintroduce the client-port-only rule.
+- Always use **FQDN endpoints**; never bare service names in a multi-namespace cluster.
+- Make placement region-aware: prefer **`broker.rack` via `configOverrides`** (node-free; verify your CFK version honours it). Fall back to the reassignment Job for existing topics and if the config path is overridden.
+- Know the ceiling: with two data regions, RF=3 is 2+1 and a full region loss makes some partitions read-only. For region-loss **write availability**, add a third **data** region (RF=3, 1+1+1) or use **RF=5** rack-aware 3+2.
+- Manage **topic CRs from one region only** — topics are cluster-wide; duplicate CRs across namespaces fight over the same object.
 
-Create the target topic (not auto-created):
-```bash
-kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
-  --bootstrap-server localhost:9092 \
-  --create --topic payment --partitions 3 --replication-factor 3 \
-  --config min.insync.replicas=2
-```
+---
 
-Fetch the schema ID (from step 9's `curl` output, or re-run it), then
-produce from **region-a**:
-```bash
-kubectl exec -it schemaregistry-0 -n kafka-region-a -- bash
-LOG_DIR=/tmp kafka-avro-console-producer --broker-list kafka.kafka-region-a.svc.cluster.local:9092 --topic payment \
-  --property schema.registry.url=http://localhost:8081 \
-  --property value.schema.id=<id-from-step-8>
-```
-Type, then **`Ctrl+D`**:
-```json
-{"payment_id": "pay-1", "order_id": "order-101", "amount": 49.99, "status": "created"}
-```
-
-Consume from **region-b** — a different namespace, a different
-broker, a different (never-registered-anything-itself) Schema Registry
-instance:
-```bash
-kubectl exec -it schemaregistry-0 -n kafka-region-b -- bash
-LOG_DIR=/tmp kafka-avro-console-consumer --bootstrap-server kafka.kafka-region-b.svc.cluster.local:9092 --topic payment \
-  --property schema.registry.url=http://localhost:8081 \
-  --from-beginning
-```
-Expected output — decoded correctly on region-b's side, proving the
-replication and the shared `_schemas` topic both genuinely span the
-cluster, not just region-a in isolation:
-```json
-{"payment_id":"pay-1","order_id":"order-101","amount":49.99,"status":"created"}
-```
-
-## Deploying: real 2.5DC (3 separate clusters)
-
-Same shape as above, but each region is a genuinely separate Kubernetes
-cluster (own `--kube-context`), so the cross-cluster networking
-prerequisites from earlier actually apply and must be verified first.
-
-**Namespace naming differs from the mock setup in one important way.**
-Each cluster's operator defaults to `namespaced: true` (unlike the
-mock's `namespaced: false`) — meaning it only watches the single
-namespace it was installed into. So the operator must be installed
-**into the same namespace as that cluster's workload**, per cluster:
-`kafka-region-a` on the region-a cluster, `kafka-region-b` on the
-region-b cluster, `kafka-region-05dc` on the 0.5DC cluster — matching
-the `namespace:` value already set in `values-region-a/b.yaml` and
-`values-05dc.yaml`.
-
-Repeat, **in each of the three clusters**:
-
-```bash
-# On the region-a cluster:
-helm upgrade --install cfk-operator confluentinc/confluent-for-kubernetes \
-  -n kafka-region-a --create-namespace --kube-context region-a
-kubectl apply --server-side -f confluent-for-kubernetes/crds/ --context region-a
-# (repeat with -n kafka-region-b --kube-context region-b, and
-#  -n kafka-region-05dc --kube-context region-05dc, on those clusters)
-```
-
-Then TLS (if `tls.enabled: true`):
-```bash
-./scripts/generate-and-distribute-tls.sh
-```
-
-Then bootstrap region-a first and propagate its `clusterID` the same
-way as the mock setup (see step 4 above) — the static voter list
-resolves quorum *discovery*, but every controller still needs an
-identical `clusterID`, which only region-a's first boot generates:
-```bash
-helm install kafka-region-a . -f values-region-a.yaml -n kafka-region-a --kube-context region-a
-kubectl get kraftcontroller kraftcontroller-region-a -n kafka-region-a --context region-a \
-  -o jsonpath='{.status.clusterID}'
-```
-Paste that into `cluster.clusterID` in `values-region-b.yaml` and
-`values-05dc.yaml`, then:
-```bash
-helm install kafka-region-b . -f values-region-b.yaml -n kafka-region-b --kube-context region-b
-helm install kafka-05dc . -f values-05dc.yaml -n kafka-region-05dc --kube-context region-05dc
-```
-
-Verify and test the same way as the mock setup (steps 5-7 above),
-adding `--context <context>` to each command as appropriate. Grant
-topic ACLs afterward with `scripts/example-acls.sh` once
-`authorization.enabled: true`.
-
-## Schema Registry: end-to-end walkthrough (setup → register → produce/consume → conformance test)
-
-This is the validated sequence — reflects what actually worked when
-tested against the `kafka-region-a` namespace, including the gotchas hit
-along the way. Swap the namespace/service DNS if you're running this
-against a real cluster instead — the commands are otherwise identical.
-
-### 1. Confirm Schema Registry is up (depends on Kafka already being up)
-
-```bash
-kubectl get pods -n kafka-region-a
-```
-Confirm `schemaregistry-0` reaches `1/1 Running`.
-
-### 2. Apply it — creates the ConfigMap + Schema CR, registered via REST by the operator
-
-```bash
-helm upgrade --install kafka-region-a . -f values-mock-region-a.yaml -n kafka-region-a
-kubectl get schema -n kafka-region-a
-```
-
-### 3. Confirm registration and note the schema ID
-
-```bash
-kubectl exec -it schemaregistry-0 -n kafka-region-a -- \
-  curl -s http://localhost:8081/subjects/payment-value/versions/latest
-```
-Note the `id` field — reference it directly in later steps rather than
-restating the full schema.
-
-### 4. Create the target topic explicitly — don't assume auto-create
-
-```bash
-kubectl exec -it kafka-0 -n kafka-region-a -- kafka-topics \
-  --bootstrap-server localhost:9092 --create --topic payment \
-  --partitions 3 --replication-factor 3 --config min.insync.replicas=2
-```
-
-### 5. Produce a conforming message
-
-```bash
-kubectl exec -it schemaregistry-0 -n kafka-region-a -- bash
-LOG_DIR=/tmp kafka-avro-console-producer --broker-list kafka.kafka-region-a.svc.cluster.local:9092 --topic payment \
-  --property schema.registry.url=http://localhost:8081 \
-  --property value.schema.id=<id-from-step-3>
-```
-Type, then **`Ctrl+D`** (not `Ctrl+C` — a hard kill can skip flushing
-the record before the process exits):
-```json
-{"payment_id": "pay-1", "order_id": "order-101", "amount": 49.99, "status": "created"}
-```
-
-`LOG_DIR=/tmp` avoids a log4j permission crash on this image's default
-log path (not writable under a non-root SCC/security-policy UID) —
-without it, the producer/consumer CLI can die *before* actually sending
-or reading anything.
-
-### 6. The valuable test: consume via region-b, not region-a — proving replication is physically real
-
-```bash
-kubectl exec -it schemaregistry-0 -n kafka-region-b -- bash
-LOG_DIR=/tmp kafka-avro-console-consumer --bootstrap-server kafka.kafka-region-b.svc.cluster.local:9092 --topic payment \
-  --property schema.registry.url=http://localhost:8081 \
-  --from-beginning
-```
-Expected output:
-```json
-{"payment_id":"pay-1","order_id":"order-101","amount":49.99,"status":"created"}
-```
-
-**Why this specific test matters, and what a same-region test would have
-missed:** consuming from `kafka-region-a` after producing there proves
-almost nothing about the *multi-region* claim — a broken, single-region
-Kafka install could pass that test just as easily. What actually needs
-proving is that a record written through region-a's broker is physically
-retrievable through a **completely different broker, in a different
-namespace, that never received the write directly** — that's the entire
-point of RF=3 replication and the whole reason this chart exists.
-
-This one test exercises the full cross-region chain in a single pass:
-- The record replicated from region-a's broker to region-b's broker over
-  the network — real bytes crossing the namespace boundary, not just a
-  topic's metadata *claiming* replicas exist in both regions.
-- Region-b's **own, independently-running** Schema Registry instance
-  correctly resolved the schema ID and decoded the record — even though
-  *it never registered that schema itself*. It only succeeded because
-  both Schema Registry instances are backed by the same shared `_schemas`
-  compacted topic on the same underlying stretched Kafka cluster.
-- The shared `clusterID` and static quorum voter list (see "Cross-namespace/cross-region
-  KRaft quorum" above) are doing real work — none of this is possible if
-  region-a and region-b were actually two separate, merely
-  similarly-labeled Kafka clusters rather than one genuine logical
-  cluster.
-
-If you only run one validation step after building this chart, make it
-this one — a same-region produce/consume test can pass even when the
-multi-region wiring is completely broken; this test cannot.
-
-### 7. Produce a non-conforming message, to see enforcement actually reject it
-
-Same producer command as step 5, but with a payload that violates the
-schema — e.g. a missing required field and the wrong type on `amount`:
-```json
-{"payment_id": "pay-2", "amount": "not-a-number", "status": "created"}
-```
-Expect Avro to reject this **client-side, before it reaches the broker**
-— a `SerializationException`/schema-mismatch error in the producer's own
-output, not a silent write.
-
-### Troubleshooting notes from getting this working
-
-- **`kafka-avro-console-producer`/`-consumer` live on the `cp-schema-registry`
-  image (`schemaregistry-0`), not on the broker image (`kafka-0`)** — the
-  broker image only ships plain, non-Avro-aware `kafka-console-producer`/
-  `-consumer`. Run Avro-aware commands from `schemaregistry-0`.
-- **`which` may not exist in these minimal images** — use `type` or
-  `command -v` instead when checking whether a CLI tool is present.
-- **`kafka-run-class kafka.tools.GetOffsetShell` no longer exists** on
-  current Kafka versions — use `kafka-topics --describe` or a plain
-  `kafka-console-consumer --from-beginning --timeout-ms 5000` instead to
-  sanity-check whether records exist on a topic.
-- **A plain (non-Avro) consumer will happily print Avro-encoded records**
-  as garbled binary text rather than erroring — that's not corruption,
-  it's just binary bytes force-printed as text. Useful as a quick "did
-  *anything* get written" check, not a substitute for the real Avro-aware
-  consumer to verify conformance/decoding.
-- **The whole enforcement mechanism is opt-in per client** — none of this
-  applies to any producer that doesn't use an Avro-aware serializer. A
-  plain `kafka-console-producer` (or a misconfigured app) can still write
-  arbitrary, non-conforming bytes straight into `payment`, completely
-  bypassing every check above.
-
-## Other things worth knowing (lessons from getting this running)
-
-- **Always check `helm install`/`upgrade` output for `Warning: unknown field`
-  lines** — a structured CR field that your installed CRD version doesn't
-  recognize gets silently dropped, not rejected. Hit this three separate
-  times on the same cluster (`controllerQuorumVoters`,
-  `podTemplate.initContainers`, `podTemplate.nodeSelector`) — see the
-  quorum section above for the full story and the working
-  `configOverrides`-based fallback.
-- **A single boolean flag driving two unrelated Kubernetes mechanisms
-  can regress silently when only one caller path is fixed** —
-  `nodeSelector.enabled` gates both the `nodeSelector` block and
-  soft-vs-hard pod anti-affinity across three separate templates
-  (`Kafka`, `KRaftController`, `SchemaRegistry`). Missing the override in
-  even one values file silently reintroduces hard anti-affinity and
-  unschedulable pods on a small test cluster. Worth grepping all values
-  files for the setting after any change to this logic, rather than
-  assuming it propagated everywhere.
-- **`image.application` / `image.init`, not `repository`/`tag`** — the
-  CRD schema wants a single combined `image:tag` string per field
-  (`confluentinc/cp-server:7.9.0`), and validates this strictly; a split
-  repo/tag shape fails CRD admission entirely.
-- **The node-ID-offset minimum (100) applies to `KRaftController`
-  specifically**, and controller/broker ID ranges must never overlap
-  *even within the same region* — Kafka's own startup validation
-  rejects a broker node ID that's also a controller quorum voter ID.
-  This can't be changed after the cluster is created, so plan spacing
-  generously (`values.yaml` documents the convention used here).
-- **CRDs and the operator are two separate installs** — applying the
-  CRDs makes Kubernetes *accept* `Kafka`/`KRaftController` objects, but
-  nothing reconciles them into actual pods until the operator itself is
-  also installed and running.
-- **`Pending`/`0/1 Running` isn't necessarily broken** — a fresh KRaft
-  controller has to format its own metadata log and elect itself leader
-  of its quorum on first boot; give it a minute or two, especially on
-  modest hardware, before assuming something's actually stuck.
-- **Storage class defaults differ per platform** — leave `storage.class: ""`
-  to use the cluster's default StorageClass rather than hardcoding one
-  that may not exist on every cluster you test against.
-- **Adding brokers never rebalances existing topics automatically** —
-  Kafka has no built-in auto-rebalancer; new brokers only get used for
-  *new* topics/partitions unless you explicitly run
-  `kafka-reassign-partitions` (or use Confluent's Self-Balancing
-  Clusters feature on `cp-server`, not wired into this chart).
-- **Unkeyed produces are not evenly distributed** — the sticky
-  partitioner batches a whole producer session onto one partition at a
-  time, not round-robin per record. Don't rely on "no key" for even
-  spread; key by whatever field needs ordering (e.g. `order_id`) if
-  partition placement matters to you.
+_Node IDs, endpoints, and policies here are examples — confirm against your CFK version and actual topology before applying._
