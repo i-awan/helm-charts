@@ -1,0 +1,156 @@
+Kafka 2.5 DC Multi-Region Cluster on OpenShift
+Architecture, durability model & operations reference (Confluent for Kubernetes)
+
+Part I — Architecture overview
+1. What this cluster is
+This is a single stretched KRaft Kafka cluster (one cluster ID, one controller quorum) spread across three OpenShift namespaces/regions, deployed with Confluent for Kubernetes (CFK). It is a “2.5 DC” topology: two full data regions plus one controller-only region acting as a quorum tiebreaker — the “0.5”.
+
+Figure 1 — 2.5 DC topology: 3 regions of controllers (one quorum), brokers in 2 regions, apps in region A.
+The design in one page
+	•	Metadata plane — 3 controllers per region × 3 regions = a 9-voter KRaft quorum. Majority is 5, so metadata survives losing any single region (and more).
+	•	Data plane — brokers in region A and region B only (region C has none). RF=3 therefore places replicas 2+1 across the two data regions.
+	•	Applications — Control Center, Schema Registry, Connect, and REST Proxy run in region A only; topic CRs are managed from region A as cluster-wide objects.
+	•	Networking — cross-region traffic must be explicitly allowed per namespace; the broker, replication, and controller ports carry the data and metadata between regions.
+Key design decisions and their trade-offs
+Decision
+Why
+Trade-off
+3-region controller quorum
+Metadata (topic/partition state) survives a full region loss
+Metadata commits need a cross-region majority — latency-sensitive
+Region C controller-only (the 0.5)
+3rd failure domain for the quorum without paying for a 3rd data copy
+Data plane still only spans 2 regions
+RF=3, minISR=2
+Standard durability floor; survives a broker failure
+On 2 data regions, RF=3 is 2+1 — a region loss makes some partitions read-only
+Apps in region A only
+Single place to manage C3 / SR / topics
+Region A is the app SPOF; those apps must reach brokers in every region
+2. Node ID scheme
+Each region gets a disjoint ID block via per-region offsets, and controllers vs brokers occupy non-overlapping ranges. Every node ID must be globally unique across all regions — collisions are what cause quorum and registration failures.
+Region
+Controllers (voters)
+Brokers (observers)
+A — kafka-region-a
+100, 101, 102
+110, 111, 112
+B — kafka-region-b
+200, 201, 202
+210, 211, 212
+C — kafka-region-05dc
+300, 301, 302
+none (controller-only)
+The static quorum voter list names all nine controllers and is byte-identical in every region. Brokers never appear in it — they are observers. IDs are fixed on disk in meta.properties at format time, so changing an offset does not renumber a node that already has state; that requires a fresh volume.
+Part II — Replication & durability model
+3. Building blocks: RF, ISR, minISR
+Replication factor (RF) is a count of distinct brokers holding each partition — RF can never exceed the brokers available in the placement scope. ISR is the set of replicas currently caught up to the leader. min.insync.replicas (minISR) is the durability floor: with acks=all, a write is only acknowledged when at least minISR replicas are in sync; below it, writes are rejected with NOT_ENOUGH_REPLICAS.
+Crucially, minISR does not create replicas — RF does. minISR only gates writes. Setting minISR=2 on a topic that has just 1 replica doesn't add a second; it guarantees that topic can never accept writes. The standard pairing is RF=3 with minISR=2: lose one replica and keep writing, lose a second and still not lose data.
+4. Losing a leader is not the problem — losing replicas is
+A partition has one leader, but the leader is not a single point of failure: if it dies, a caught-up follower is promoted automatically. What stops writes is the ISR count falling below minISR, which depends on how many replicas survive — not on where the leader was. If a region holds a majority of a partition's replicas (2 of 3) and goes down, the partition drops below minISR and goes read-only regardless of leader location.
+5. Region-failure survival: why 2 regions can't, but 3 can
+Three replicas can't split evenly across two regions — the split is 2 + 1. Lose the region holding 2 and only 1 survives (below minISR → read-only). With three regions the split is 1 + 1 + 1, so any single region can be lost while two in-sync replicas remain.
+
+Figure 2 — RF=3 / minISR=2 under a region failure: 2 regions (left, read-only) vs 3 regions (right, writable).
+Layout
+Replicas / region
+Left after region loss
+Writes survive?
+3 brokers × 2 regions (this cluster)
+2 + 1
+1
+No
+1 broker × 3 regions
+1 + 1 + 1
+2
+Yes
+3 brokers × 3 regions (rack-aware)
+1 + 1 + 1
+2
+Yes
+Survival is a function of failure domains (regions), not broker count. This cluster's 6 brokers over 2 regions tolerate a broker failure but not a full data-region loss.
+6. A region loss is uneven
+Impact is per-partition: which region holds a partition's 2-replica majority varies, so a region loss leaves roughly half the partitions writable and half read-only — a patchy outage. A single topic can be simultaneously up and down; with keyed partitioning, some keys' writes fail deterministically while others succeed. Three regions removes this: every partition keeps 2 in-sync replicas, so the failure mode is uniform.
+7. Why lowering minISR to 1 is the wrong fix
+min.insync.replicas=1 stops write-blocking but trades away durability permanently, during stable operation — not just during an outage. A write can be acked on the leader alone; if it then crashes before a follower copies, the acknowledged write is silently lost. It also makes routine rolling restarts risky (no floor) and masks single-copy degradation. Reserve minISR=1 for loss-tolerant data (replayable logs, metrics), set per-topic, never as the cluster default — the default would weaken internal topics like _schemas and __consumer_offsets too.
+8. Alternative for two regions: RF=5
+If a third data region isn't available, RF=5 across two regions is the one arrangement that survives a region loss within two regions. Five replicas split 3+2, so the worst case (losing the 3-replica region) still leaves 2 — exactly minISR. It requires rack-aware 3+2 placement (else it may land 4+1 or 5+0), ≥5 brokers (aim for 6, as 3+3), caps you at minISR=2, and costs 5× storage. Compared with RF=3 over three regions: RF=5/2-region needs no third data region but acks on a minority (2 of 5) and stores more; RF=3/3-region is leaner and acks on a majority but needs brokers in a third region.
+Part III — Configuration reference
+9. Controller quorum (static voters)
+With 3 controllers per region, the static voter list has 9 entries — all controllers, on the controller listener (9074), identical in every region. Brokers are never listed. Managed in values as structured data and rendered into each KRaftController CR's configOverrides.server:
+controller.quorum.voters=100@<a-ctrl-0>:9074,101@<a-ctrl-1>:9074, ... ,302@<c-ctrl-2>:9074
+Each endpoint is the controller pod's stable StatefulSet FQDN: kraftcontroller-<region>-<ordinal>.kraftcontroller-<region>.<namespace>.svc.cluster.local:9074. Verify with kafka-metadata-quorum ... describe --status — CurrentVoters should list all nine IDs with one leader; observers should list the brokers (110–112, 210–212).
+10. Replication-factor defaults (internal topics)
+RF for internal topics is set per-component at creation time — they do not inherit default.replication.factor, and existing topics keep their creation-time RF (reassignment needed to change it). Set these before first boot so internal topics are born at RF=3.
+On the Kafka CR (configOverrides.server)
+default.replication.factor=3  ·  offsets.topic.replication.factor=3  ·  transaction.state.log.replication.factor=3  ·  confluent.license.topic.replication.factor=3  ·  min.insync.replicas=2
+On the component CRs
+	•	SchemaRegistry: kafkastore.topic.replication.factor=3
+	•	ControlCenter: confluent.controlcenter.internal.topics.replication=3, confluent.controlcenter.command.topic.replication=3, confluent.monitoring.interceptor.topic.replication=3, confluent.metrics.topic.replication=3  (Control Center uses .replication, not .replication.factor).
+11. Endpoints: always FQDN
+Every component's bootstrapEndpoint and C3's connectUrl must use the fully-qualified kafka.<namespace>.svc.cluster.local:9071 form, never a bare kafka:9071. A bare name resolves in the caller's namespace, so it silently points at the wrong cluster (or fails) from another region. This cluster is plaintext, so endpoints are http:// / port 9071, TLS off.
+Part IV — Cross-region networking
+12. The most important operational lesson
+On a stretched cluster, brokers, controllers, and components must reach each other across namespaces. NetworkPolicy is default-deny per namespace, so each destination namespace needs its own ingress rule. A policy that allows only the external client port (9092) lets the cluster form at the metadata level but blocks data replication between regions — which surfaces as misleading license, placement, and registration errors.
+Metadata plane vs. data plane
+Membership and data access travel on different ports and fail independently. A controller quorum showing another region's brokers as members (describe --status) proves membership, not that a broker there can read topic data — that fetch is a separate connection to the partition leader on the broker/replication listener. The gap between the two is exactly where a port-restricted NetworkPolicy bites.
+Ports to allow cross-namespace
+Port
+Purpose
+Cross-namespace
+9071
+Internal broker listener — inter-broker replication & data fetch
+Required (both directions)
+9072
+Replication listener
+Required (both directions)
+9074
+Controller listener (KRaft quorum)
+Required (all regions)
+9092
+External client listener
+Insufficient alone
+Also open component → broker paths: Control Center and Schema Registry live in region A but manage/read the whole cluster, so they must reach brokers in every region. Because policy is per destination namespace, allowing C3/SR into region B requires a rule in region B's namespace — and scope it to the whole region-A namespace (not just the C3 pod) so Schema Registry is covered when a _schemas leader lands in region B.
+Verify
+From a throwaway pod in the source namespace (works even if brokers crash-loop): </dev/tcp/kafka.<other-ns>.svc.cluster.local/9071 should connect, in both directions and for 9072/9074. Keep these NetworkPolicies in the Helm chart / IaC — a namespace rebuild otherwise reintroduces the client-port-only rule. NetworkPolicies are a security control; widening them is the platform team's call.
+Part V — Troubleshooting runbook
+13. Symptom → cause → fix
+Every issue below was seen building this cluster. The recurring meta-lesson: on a stretched cluster, suspect stale on-disk node state or the cross-region network path before the Kafka config.
+Symptom
+Root cause
+Fix
+INCONSISTENT_CLUSTER_ID (104) on fetch/vote
+A node booted on a stale volume with a different cluster ID (or cluster ID not shared across regions)
+Ensure the same cluster ID across regions; clear the odd node's PVC so it reformats to the quorum's ID
+Node ID appears as both voter and observer / duplicate
+Identical ID offsets across regions, or stale meta.properties
+Disjoint per-region offsets; clear stale volumes so nodes reformat under new IDs
+Controller: "node 201 must be in the set of voters"
+Scaled controllers to 3/region but static voter list still had 1/region
+List all 9 controllers in controller.quorum.voters, identical in every region
+Control Center: "failed to get bootstrap cluster id"
+Bare bootstrapEndpoint (kafka:9071) resolved wrong from its namespace
+Use FQDN kafka.<ns>.svc.cluster.local:9071
+Schema Registry: "failed to write Noop record"
+_schemas ISR < minISR (too few brokers / clumped replicas)
+Ensure enough brokers; RF=3 with a replica in each region
+Broker: "valid license must be configured" (region B)
+Brokers can't read _confluent-command — its replicas were all in region A AND 9071 was blocked cross-region
+Open 9071/9072 cross-region; reassign the topic to include a region-B broker
+Reassign: "unknown broker 210"
+Target broker crash-looping, so not a registered/eligible target
+Fix the crash first (networking) so the broker stays up, then reassign
+Internal topic has all replicas in region A
+Topic created while only region-A brokers existed (region A installed first for cluster ID)
+Reassign 2+1 across regions once all brokers are healthy; set RF defaults before creation
+Init container ErrImagePull: certificate expired/not yet valid
+Node clock skew (TLS cert validation fails)
+Fix node time sync (chrony/NTP) — a node/infra action, not a Kafka change
+14. Recommendations
+	•	Keep RF=3 / minISR=2 as the durability standard; set the internal-topic RF defaults (§10) before first boot.
+	•	Bake the cross-region NetworkPolicies into IaC (9071/9072/9074 both directions, all region pairs, plus component→broker) so a rebuild can't reintroduce the client-port-only rule.
+	•	Always use FQDN endpoints; never bare service names in a multi-namespace cluster.
+	•	Know the ceiling: with two data regions, RF=3 is 2+1 and a full region loss makes some partitions read-only. For region-loss write availability, either add a third data region (RF=3, 1+1+1) or use RF=5 rack-aware 3+2 (§8).
+	•	Rack awareness needs node labels + operator RBAC on nodes. If node access is unavailable, placement stays manual — check internal-topic placement after install and reassign any that clump in one region.
+	•	Manage topic CRs from one region only — topics are cluster-wide; duplicate CRs across namespaces fight over the same object.
+Reference compiled from the 2.5 DC build. Node IDs, endpoints, and policies are examples — confirm against your CFK version and actual topology before applying.
