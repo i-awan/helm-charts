@@ -1,0 +1,151 @@
+Stage 0 — Preconditions (verify before testing)
+
+Confirm you actually have the HA topology before testing failover, or you'll test the wrong thing.
+
+bash
+# SR pods exist in BOTH regions
+oc get pods -n kafka-region-a | grep -i schema
+oc get pods -n kafka-region-b | grep -i schema
+
+# both share the SAME group id and are leader-eligible
+oc get schemaregistry -n kafka-region-a -o yaml | grep -iE "group.id|eligibility"
+oc get schemaregistry -n kafka-region-b -o yaml | grep -iE "group.id|eligibility"
+
+# _schemas is RF=4, spread 2+2 across regions, full ISR
+oc exec <broker-pod> -n kafka-region-a -- \
+  kafka-topics --bootstrap-server localhost:9071 --describe --topic _schemas
+
+Pass criteria: SR pod in each region; identical group.id; both leader.eligibility=true; _schemas shows RF=4, replicas spanning 110/210-range brokers, ISR=4.
+
+Stage 1 — Identify the current primary
+
+Only one SR is primary; know which before you test.
+
+bash
+# ask each SR instance who the leader is (the /v1/metadata/id or mode endpoint)
+curl -s http://schemaregistry.kafka-region-a.svc.cluster.local:8081/v1/metadata/id
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/v1/metadata/id
+
+Record which instance is primary (expect region A in steady state).
+
+
+Stage 2 — Baseline functionality (both regions healthy)
+
+Prove reads and writes work through both SR endpoints before any failure.
+
+bash
+# WRITE a schema via region A (primary) — should succeed
+curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"schema":"{\"type\":\"record\",\"name\":\"HATest\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}"}' \
+  http://schemaregistry.kafka-region-a.svc.cluster.local:8081/subjects/ha-test-value/versions
+
+# READ it back via region B (secondary) — should return the same schema
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects/ha-test-value/versions/latest
+
+# WRITE via region B (secondary) — should also succeed (forwarded to primary)
+curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"schema":"{\"type\":\"record\",\"name\":\"HATest2\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}"}' \
+  http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects/ha-test2-value/versions
+
+Pass criteria: write via A succeeds; read via B returns the same schema (proves shared store); write via B succeeds (proves secondary forwards to primary). This confirms the primary-secondary wiring works end to end.
+
+
+
+
+Stage 3 — SR pod failure (single instance, not whole region)
+
+Test SR-level HA first — the simplest failure. Kill the primary SR pod only.
+
+bash
+# delete the primary SR pod (region A)
+oc delete pod <region-a-schema-pod> -n kafka-region-a
+
+# immediately poll region B — reads must keep working
+watch -n1 'curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects/ha-test-value/versions/latest'
+
+# check who's primary now
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/v1/metadata/id
+
+Pass criteria: reads via region B never fail; region B is elected primary (auto-failover); once region A's SR pod restarts, it rejoins as secondary. This isolates "SR failover works" from "region failover works."
+
+
+
+Stage 4 — The main event: region A failure
+
+This is the real HA test. Simulate region A going down and verify region B keeps serving.
+
+Simulate region-A SR loss (scale SR to zero in region A — cleaner than killing brokers, tests the SR-serving-in-B path):
+
+bash
+oc scale statefulset <region-a-schema-sts> -n kafka-region-a --replicas=0
+# (or deployment, depending on how CFK deploys it)
+
+Then verify region B:
+
+bash
+# READS via region B — must succeed (existing schemas)
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects/ha-test-value/versions/latest
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects
+
+# region B should now be primary
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/v1/metadata/id
+
+Pass criteria: all reads via region B succeed; region B is now primary. This proves the thing that matters — a surviving SR in region B serves schemas when region A is gone
+
+
+
+Stage 5 — The honest one: writes during a true region-A outage
+
+This is where your RF=4/minISR=3 choice shows up, and you should test it explicitly so there are no surprises in a real outage.
+
+To test it properly you need _schemas to actually be below minISR — which means taking down region-A brokers (not just SR), so _schemas drops to its 2 region-B replicas:
+
+bash
+# take region A's brokers offline (simulates real region loss)
+oc scale statefulset <region-a-kafka-sts> -n kafka-region-a --replicas=0
+
+# _schemas now has only 2 ISR (region B) — below minISR=3
+oc exec <region-b-broker-pod> -n kafka-region-b -- \
+  kafka-topics --bootstrap-server localhost:9071 --describe --topic _schemas
+
+# READ via region B — should still WORK
+curl -s http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects/ha-test-value/versions/latest
+
+# WRITE a NEW schema via region B — EXPECTED TO FAIL (minISR not met)
+curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"schema":"{\"type\":\"record\",\"name\":\"OutageTest\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}"}' \
+  http://schemaregistry.kafka-region-b.svc.cluster.local:8081/subjects/outage-test-value/versions
+
+Pass criteria (this is the important expectation): reads succeed, but the new-schema write fails (error referencing not-enough-replicas / timeout). This is correct behaviour for your design — it confirms the "read continuity, not write continuity during region loss" property you accepted. Testing it now means no one is surprised in a real incident.
+
+
+
+
+Stage 6 — Recovery
+
+Bring region A back and confirm the cluster re-converges.
+
+bash
+oc scale statefulset <region-a-kafka-sts> -n kafka-region-a --replicas=2
+oc scale statefulset <region-a-schema-sts> -n kafka-region-a --replicas=1
+
+# _schemas ISR returns to 4
+oc exec <broker-pod> -n kafka-region-a -- \
+  kafka-topics --bootstrap-server localhost:9071 --describe --topic _schemas
+
+# writes work again via either endpoint
+curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"schema":"{\"type\":\"record\",\"name\":\"RecoveryTest\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}"}' \
+  http://schemaregistry.kafka-region-a.svc.cluster.local:8081/subjects/recovery-test-value/versions
+
+Pass criteria: ISR back to 4; writes succeed again; both SRs healthy, one primary one secondary. Verify no schema data was lost (the schemas registered before the outage are all still present).
+
+
+
+What each stage proves
+Stage	Failure tested	What it proves
+2	None (baseline)	Primary-secondary wiring works; shared store
+3	Primary SR pod dies	SR-level auto-failover
+4	Region-A SR gone	Region B serves schemas when A is down (the core HA goal)
+5	Region-A brokers gone	Reads survive; writes blocked by minISR=3 (accepted trade-off)
+6	Recovery	Clean re-convergence, no data loss
