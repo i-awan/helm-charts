@@ -1,4 +1,17 @@
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-test-client-config
+  namespace: kafka-region-a
+data:
+  client.properties: |
+    security.protocol=SSL
+    ssl.truststore.type=PEM
+    ssl.truststore.location=/mnt/kafka-tls/ca.crt
+    ssl.keystore.type=PEM
+    ssl.keystore.location=/tmp/keystore.pem
+---
+apiVersion: v1
 kind: Pod
 metadata:
   name: kafka-test-client
@@ -11,9 +24,19 @@ spec:
       command: ["sleep", "infinity"]
       volumeMounts:
         - name: client-tls
-          mountPath: /mnt/certs
+          mountPath: /mnt/kafka-tls
           readOnly: true
+        - name: client-config
+          mountPath: /mnt/config
+          readOnly: true
+        - name: scratch
+          mountPath: /tmp
   volumes:
     - name: client-tls
       secret:
         secretName: kafka-test-client-tls
+    - name: client-config
+      configMap:
+        name: kafka-test-client-config
+    - name: scratch
+      emptyDir: {}
