@@ -1,0 +1,119 @@
+# region-b  - full region (brokers + controller). Install AFTER region-a,
+# once you've fetched its clusterID and pasted it below.
+
+namespace: kafka-region-a
+
+
+cluster:
+  clusterID: ""   # leave blank on first bootstrap install, then fetch and reuse
+  replicationFactor: 2
+  minInsyncReplicas: 2
+
+region:
+  name: region-a
+  mode: full
+
+tls:
+  # Both flags needed together  - see values-region-a.yaml for why.
+  enabled: true
+  certManager:
+    enabled: true
+    bootstrapRoot: true 
+    rootSecretName: kafka-root-ca        # identical across every region's values file
+    rootNamespace: kafka-region-a  
+    kafka:      # the namespace bootstrapRoot:true is set in
+      commonName: kafka.kafka-region-a.svc.cluster.local
+      dnsNames:                # SANs for THIS region's leaf cert  - match its actual internal DNS
+        - kafka.kafka-region-a.svc.cluster.local
+        - kafka-0.kafka.kafka-region-a.svc.cluster.local
+        - kafka-1.kafka.kafka-region-a.svc.cluster.local
+        - kafka-2.kafka.kafka-region-a.svc.cluster.local
+        - "*.kafka-region-a.svc.cluster.local"
+    controlcenter:      # the namespace bootstrapRoot:true is set in
+      commonName: controlcenter.kafka-region-a..svc.cluster.local
+      dnsNames:                # SANs for THIS region's leaf cert  - match its actual internal DNS
+        - controlcenter.kafka-region-a..svc.cluster.local
+        - controlcenter-0.kafka-region-a..svc.cluster.local
+        - "*.kafka-region-a.svc.cluster.local"
+    kraftController:
+      commonName: kraftcontroller.kafka-region-a.svc.cluster.local
+      dnsNames:
+        # Controller service
+        - kraftcontroller.kafka-region-a.svc.cluster.local
+        # Controller StatefulSet pods
+        - kraftcontroller-0.kraftcontroller.kafka-region-a.svc.cluster.local
+        - kraftcontroller-1.kraftcontroller.kafka-region-a.svc.cluster.local
+        - kraftcontroller-2.kraftcontroller.kafka-region-a.svc.cluster.local
+        # Wildcard covers the controller pod names
+        - "*.kraftcontroller.kafka-region-a.svc.cluster.local"
+    schemaRegistry:
+      commonName: schemaeregistry.kafka-region-a.svc.cluster.local
+      dnsNames:
+        # Controller service
+        - schemaeregistry.kafka-region-a.svc.cluster.local
+        # Controller StatefulSet pods
+        - schemaeregistry-0.kraftcontroller.kafka-region-a.svc.cluster.local
+        # Wildcard covers the controller pod names
+        - "*.schemaeregistry.kafka-region-a.svc.cluster.local"
+
+authorization:
+  enabled: false
+
+controllerIdOffset: 100
+brokerIdOffset: 110
+
+# Paste the clusterID fetched from region-a here before installing.
+cluster:
+  clusterID: ""
+
+# Identical to region-a's list  - every controller, every region. Same
+# internal-DNS caveat: correct for namespaces-on-one-cluster, needs real
+# cross-cluster addresses once region-a/b/05dc are genuinely separate
+# clusters.
+
+# staticQuorumVoters:
+#   - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
+#     nodeId: 100
+#   - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
+#     nodeId: 200
+#   - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
+#     nodeId: 300
+
+schemaRegistry:
+  kafkaBootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9092
+
+kraftController:
+  replicas: 1
+  storage:
+    class: ""
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 256Mi
+    limits:
+      cpu: "500m"
+      memory: 512Mi
+
+kafka:
+  replicas: 2
+  storage:
+    class: ""
+    size: 100Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 768Mi
+    limits:
+      cpu: "1"
+      memory: 1536Mi
+
+  externalAccess:
+    enabled: false
+
+nodeSelector:
+  enabled: false
+
+
+k get pod controlcenter-0-n kafka-region-a \
+-o jsonpath='{.spec.containers[*].image}{"\n"}{.spec.initContainers[*].image}{"\n"}'

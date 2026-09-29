@@ -2,7 +2,7 @@
 apiVersion: platform.confluent.io/v1beta1
 kind: SchemaRegistry
 metadata:
-  name: {{ .Values.schemaRegistry.clusterRefName }}
+  name: {{ .Values.schemaRegistry.name }}
   namespace: {{ .Values.namespace }}
 spec:
   replicas: {{ .Values.schemaRegistry.replicas }}
@@ -35,7 +35,7 @@ spec:
       # Blocks with a clean, expected "waiting for..." log line until
       # Kafka's listener is actually reachable, instead of letting the
       # main schemaregistry container crash-loop with a Java stack trace
-      # while Kafka is still coming up. Purely a UX/log-cleanliness fix —
+      # while Kafka is still coming up. Purely a UX/log-cleanliness fix  -
       # Schema Registry would eventually succeed via its own retries
       # either way; this just makes the wait visible and quiet.
       - name: wait-for-kafka
@@ -51,10 +51,12 @@ spec:
             echo "kafka is reachable, continuing"
     {{- end }}
   {{- if .Values.tls.enabled }}
+  tls:
+    secretRef: schemaregistry-tls
   listeners:
-    api:
+    internal:
       tls:
-        enabled: true
-        secretRef: {{ .Values.tls.secretRef }}
+        enabled: {{ .Values.tls.enabled }}
+        secretRef: schemaregistry-tls
   {{- end }}
 {{- end }}

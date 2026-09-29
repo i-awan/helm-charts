@@ -9,7 +9,7 @@ Kubernetes (CFK). Full rationale and troubleshooting history: `README.md`.
 
 | Mode | Values files | Kubernetes scope |
 |---|---|---|
-| Mock 2.5DC (start here) | `values-mock-region-a/b.yaml`, `values-mock-05dc.yaml` | 1 cluster, 3 namespaces |
+| Mock 2.5DC (start here) | `values-region-a/b.yaml`, `values-05dc.yaml` | 1 cluster, 3 namespaces |
 | Real 2.5DC | `values-region-a/b.yaml`, `values-05dc.yaml` | 3 clusters |
 
 Both follow the same steps below — differences noted inline.
@@ -138,13 +138,13 @@ kubectl apply --server-side -f confluent-for-kubernetes/crds/
 
 **4. Bootstrap region-a, fetch `clusterID`:**
 ```bash
-helm install kafka-region-a . -f values-mock-region-a.yaml -n kafka-region-a
+helm install kafka-region-a . -f values-region-a.yaml -n kafka-region-a
 kubectl get kraftcontroller kraftcontroller-region-a -n kafka-region-a -o jsonpath='{.status.clusterID}'
 ```
 Paste into `cluster.clusterID` in region-b/05dc's values files, then:
 ```bash
-helm install kafka-region-b . -f values-mock-region-b.yaml -n kafka-region-b
-helm install kafka-05dc . -f values-mock-05dc.yaml -n kafka-region-05dc
+helm install kafka-region-b . -f values-region-b.yaml -n kafka-region-b
+helm install kafka-05dc . -f values-05dc.yaml -n kafka-region-05dc
 ```
 (Real clusters: same commands, add `-n <region-namespace> --kube-context <ctx>`.)
 

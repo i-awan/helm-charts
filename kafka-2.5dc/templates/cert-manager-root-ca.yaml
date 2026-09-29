@@ -1,0 +1,31 @@
+{{- if and .Values.tls.certManager.enabled .Values.tls.certManager.bootstrapRoot }}
+# The ONLY SelfSigned issuer in the whole pattern  - used exactly once,
+# to bootstrap a real, reusable root CA. Every other region's Issuer is
+# type `ca`, referencing the Secret this produces (copied in by
+# cert-manager-ca-distributor.yaml), never SelfSigned again.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kafka-root-bootstrap
+  namespace: {{ .Values.namespace }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kafka-root-ca
+  namespace: {{ .Values.namespace }}
+spec:
+  isCA: true
+  secretName: {{ .Values.tls.certManager.rootSecretName }}
+  commonName: kafka-2-5dc-root-ca
+  issuerRef:
+    name: kafka-root-bootstrap
+    kind: Issuer
+  # Long-lived  - this is the shared trust anchor for the whole cluster;
+  # rotating it means re-trusting every region, not something to do
+  # casually or often.
+  duration: 87600h    # 10 years
+  renewBefore: 720h    # 30 days
+{{- end }}

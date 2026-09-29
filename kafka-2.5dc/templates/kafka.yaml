@@ -2,7 +2,7 @@
 apiVersion: platform.confluent.io/v1beta1
 kind: Kafka
 metadata:
-  name: {{ .Values.cluster.name }}
+  name: {{ .Values.kafka.name }}
   namespace: {{ .Values.namespace }}
   annotations:
     platform.confluent.io/broker-id-offset: {{ .Values.brokerIdOffset | quote }}
@@ -16,14 +16,18 @@ spec:
   storageClass:
     name: {{ .Values.kafka.storage.class }}
   {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretRef: {{ .Values.tls.secretRef }}
+  {{- end }}
   dependencies:
     kRaftController:
       clusterRef:
-        name: {{ include "kafka-2.5dc.controllerName" . }}
+        name: {{ .Values.kraftController.name }}
         namespace: {{ .Values.namespace }}
       {{- if .Values.tls.enabled }}
       # Required by CFK whenever the KRaftController's own controller
-      # listener has TLS enabled — this is NOT inherited automatically
+      # listener has TLS enabled  - this is NOT inherited automatically
       # via clusterRef, and must be configured identically to the
       # KRaftController CR's listeners.controller.tls block, or the
       # broker connects to the controller port in plaintext and fails
@@ -51,7 +55,7 @@ spec:
     affinity:
       podAntiAffinity:
         {{- if not .Values.nodeSelector.enabled }}
-        # Soft preference when nodeSelector.enabled: false — same
+        # Soft preference when nodeSelector.enabled: false  - same
         # reasoning as the KRaftController template.
         preferredDuringSchedulingIgnoredDuringExecution:
           - weight: 100
@@ -78,22 +82,31 @@ spec:
       # Rack awareness: ties replica placement to the region label above,
       # so partition replicas spread across regions, not just brokers.
       - broker.rack={{ .Values.region.name }}
-      {{- if .Values.kafka.rackAwareFetching.enabled }}
+      {{- if .Values.rackAwareFetching.enabled }}
       # Lets a consumer that sets client.rack=<region> fetch from a LOCAL
       # replica (leader or follower) instead of always crossing to
       # whichever broker leads the partition. This is a preference, not
-      # a guarantee — falls back to the leader if no local replica
+      # a guarantee  - falls back to the leader if no local replica
       # exists. Produce is unaffected: producers always write to the
       # leader regardless of region, since only the leader accepts
-      # writes at all. Client apps must set client.rack themselves —
+      # writes at all. Client apps must set client.rack themselves  -
       # nothing server-side can force this on an unconfigured consumer.
       - replica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector
       {{- end }}
       - default.replication.factor={{ .Values.cluster.replicationFactor }}
       - min.insync.replicas={{ .Values.cluster.minInsyncReplicas }}
-      # Never promote an out-of-sync replica — see conversation notes on
+      # Never promote an out-of-sync replica  - see conversation notes on
       # why this must stay false for a stretched cluster.
       - unclean.leader.election.enable=false
+      {{- if .Values.tls.mtls.enabled }}
+      # Mutual TLS: demands the CONNECTING side also present a valid
+      # cert on the internal listener (client traffic + inter-broker
+      # replication both ride this listener in this chart). Requires
+      # the shared-CA pattern (tls.certManager) so every peer's cert is
+      # actually verifiable  - a per-region SelfSigned cert would make
+      # every OTHER region's broker fail this check.
+      - listener.name.internal.ssl.client.auth=required
+      {{- end }}
       {{- if .Values.authorization.enabled }}
       - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
       - confluent.authorizer.access.rule.providers=KRAFT_ACL
@@ -113,13 +126,13 @@ spec:
       externalAccess:
         type: {{ .Values.kafka.externalAccess.type }}
         {{- if eq .Values.kafka.externalAccess.type "loadBalancer" }}
-        loadBalancer: 
+        loadBalancer:
           domain: {{ .Values.kafka.externalAccess.domain }}
         {{- else if eq .Values.kafka.externalAccess.type "nodePort" }}
-        # No SNI/hostname routing needed — each broker gets its own raw
+        # No SNI/hostname routing needed  - each broker gets its own raw
         # TCP port directly on the node, starting from nodePortOffset.
         # TLS isn't structurally required for this to route correctly
-        # (unlike loadBalancer/route, which need TLS for SNI to work) —
+        # (unlike loadBalancer/route, which need TLS for SNI to work)  -
         # though you'll still want it for anything beyond local testing.
         nodePort:
           nodePortOffset: {{ .Values.kafka.externalAccess.nodePort.nodePortOffset }}
@@ -127,10 +140,10 @@ spec:
         {{- else if eq .Values.kafka.externalAccess.type "route" }}
         # OpenShift-native. Requires TLS (routes use SNI to pick the
         # right per-broker backend, which needs a TLS handshake to
-        # inspect) — set tls.enabled: true or this won't route
+        # inspect)  - set tls.enabled: true or this won't route
         # correctly. CFK creates N+1 Route objects (bootstrap + one per
         # broker); you still need real DNS entries pointing each
-        # resulting hostname at your OpenShift router — CFK doesn't
+        # resulting hostname at your OpenShift router  - CFK doesn't
         # manage DNS itself.
         route:
           domain: {{ .Values.kafka.externalAccess.route.domain }}

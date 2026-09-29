@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-test-client
+  namespace: kafka-region-a
+spec:
+  restartPolicy: Never
+  containers:
+    - name: kafka-test-client
+      image: confluentinc/cp-schema-registry:7.9.0
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: client-tls
+          mountPath: /mnt/certs
+          readOnly: true
+  volumes:
+    - name: client-tls
+      secret:
+        secretName: kafka-test-client-tls

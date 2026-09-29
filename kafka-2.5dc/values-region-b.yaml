@@ -1,0 +1,69 @@
+# region-b  - full region (brokers + controller). Install AFTER region-a,
+# once you've fetched its clusterID and pasted it below.
+
+namespace: kafka-region-b
+
+region:
+  name: region-b
+  mode: full
+
+tls:
+  # Both flags needed together  - see values-region-a.yaml for why.
+  enabled: true
+  certManager:
+    enabled: true   # must be true on EVERY region's values file
+    # bootstrapRoot stays false here  - region-a is the root.
+authorization:
+  enabled: false
+
+controllerIdOffset: 200
+brokerIdOffset: 210
+
+# Paste the clusterID fetched from region-a here before installing.
+cluster:
+  clusterID: "NDA5MmIyNTctYzI5Zi00Yw"
+
+# Identical to region-a's list  - every controller, every region. Same
+# internal-DNS caveat: correct for namespaces-on-one-cluster, needs real
+# cross-cluster addresses once region-a/b/05dc are genuinely separate
+# clusters.
+staticQuorumVoters:
+  - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
+    nodeId: 100
+  - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
+    nodeId: 200
+  - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
+    nodeId: 300
+
+schemaRegistry:
+  kafkaBootstrapEndpoint: kafka.kafka-region-b.svc.cluster.local:9092
+
+kraftController:
+  storage:
+    class: ""
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+kafka:
+  replicas: 3
+  storage:
+    class: ""
+    size: 100Gi
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  externalAccess:
+    enabled: false
+
+nodeSelector:
+  enabled: false

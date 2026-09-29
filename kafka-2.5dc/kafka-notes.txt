@@ -1,0 +1,47 @@
+
+
+kubectl get kraftcontroller kraftcontroller-region-a -n kafka-region-a -o jsonpath='{.status.clusterID}'
+
+
+Exec in and build the client config (same as before)
+
+kubectl exec -it kafka-test-client -n kafka-region-a -- bash
+cat /mnt/certs/tls.crt /mnt/certs/tls.key > /tmp/keystore.pem
+cat > /tmp/client.properties <<EOF
+security.protocol=SSL
+ssl.keystore.type=PEM
+ssl.keystore.location=/tmp/keystore.pem
+ssl.truststore.type=PEM
+ssl.truststore.location=/mnt/certs/ca.crt
+EOF
+
+Create topic 
+kafka-topics --bootstrap-server kafka.kafka-region-a.svc.cluster.local:9092 \
+  --command-config /tmp/client.properties \
+  --create --topic payment-test --partitions 3 --replication-factor 6
+
+
+Create schema 
+
+curl --cacert /mnt/certs/ca.crt \
+     --cert /mnt/certs/tls.crt \
+     --key /mnt/certs/tls.key \
+  -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"schema": "{\"type\":\"record\",\"name\":\"Payment\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"},{\"name\":\"amount\",\"type\":\"double\"}]}"}' \
+  https://schemaregistry.kafka-region-a.svc.cluster.local:8081/subjects/payment-test-value/versions
+
+
+Produce message 
+
+kafka-avro-console-producer \
+  --bootstrap-server kafka.kafka-region-a.svc.cluster.local:9092 \
+  --topic payment-test \
+  --producer.config /tmp/client.properties \
+  --property schema.registry.url=https://schemaregistry.kafka-region-a.svc.cluster.local:8081 \
+  --property schema.registry.ssl.truststore.location=/mnt/certs/ca.crt \
+  --property schema.registry.ssl.truststore.type=PEM \
+  --property schema.registry.ssl.keystore.location=/tmp/keystore.pem \
+  --property schema.registry.ssl.keystore.type=PEM \
+  --property value.schema='{"type":"record","name":"Payment","fields":[{"name":"id","type":"string"},{"name":"amount","type":"double"}]}'
+  
+  {"id": "abc123", "amount": 42.50}

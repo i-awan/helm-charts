@@ -9,7 +9,7 @@ description: >
 
   This chart is installed ONCE PER REGION (three times total), against
   that region's own OpenShift cluster context, using a region-specific
-  values file. It does NOT install the CFK operator itself — install
+  values file. It does NOT install the CFK operator itself  - install
   confluentinc/confluent-for-kubernetes separately in each region first.
 type: application
 version: 0.1.0

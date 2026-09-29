@@ -1,6 +1,8 @@
-# Single-cluster test/dev deployment. Install this against ONE OpenShift
-# cluster, with the CFK operator already installed in it. No region node
-# labels, no cross-cluster networking, no second/third cluster required.
+# Single-cluster test/dev deployment  - the fastest possible smoke test
+# on any new cluster (k3s, a dedicated Kubernetes cluster, OpenShift,
+# whatever). Install against ONE cluster, with the CFK operator already
+# installed in it. No region node labels, no cross-cluster networking,
+# no second/third cluster required.
 #
 #   helm install kafka-test . -f values-standalone.yaml -n confluent
 #
@@ -10,19 +12,19 @@
 standalone: true
 
 # Anti-affinity strictness is now driven purely by nodeSelector.enabled
-# (not standalone) — set explicitly here to keep soft scheduling on a
+# (not standalone)  - set explicitly here to keep soft scheduling on a
 # small/single-node test cluster.
 nodeSelector:
   enabled: false
 
 region:
-  name: standalone   # cosmetic label only in this mode — no node selector is applied
+  name: standalone   # cosmetic label only in this mode  - no node selector is applied
   mode: full           # renders both KRaftController and Kafka
 
 controllerIdOffset: 100
 brokerIdOffset: 110
 cluster:
-  clusterID: ""         # left blank — CFK generates one for this cluster
+  clusterID: ""         # left blank  - CFK generates one for this cluster
   replicationFactor: 1  # bump to 3 once you add real brokers/nodes to test real replication
   minInsyncReplicas: 1  # bump to 2 alongside RF=3 when you're testing durability behavior
 
@@ -57,7 +59,7 @@ kafka:
   externalAccess:
     enabled: false   # keep traffic in-cluster for a quick test
 
-# Simplify for a fast first test — turn both back on once you're testing
+# Simplify for a fast first test  - turn both back on once you're testing
 # something closer to the production posture.
 tls:
   enabled: false

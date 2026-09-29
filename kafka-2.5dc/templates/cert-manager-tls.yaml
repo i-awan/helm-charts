@@ -1,0 +1,280 @@
+{{- if .Values.tls.certManager.enabled }}
+# `ca`-type Issuer, referencing the shared root CA Secret  - LOCAL to
+# this namespace either way: bootstrapped directly here if this is the
+# root region (cert-manager-root-ca.yaml), or copied in by the
+# distributor CronJob if not (cert-manager-ca-distributor.yaml). Never
+# `selfSigned` here  - that's what breaks cross-region trust; see the
+# comment on tls.certManager in values.yaml for the full reasoning.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kafka-tls-issuer
+spec:
+  ca:
+    secretName: "{{ .Values.tls.certManager.rootSecretName }}"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kafka-tls-cert
+spec:
+  # Same name as tls.secretRef  - nothing else in this chart needs to
+  # change. The translator CronJob below adds CFK's expected key names
+  # onto this SAME secret rather than creating a second one.
+  secretName: "{{ .Values.tls.secretRef }}"
+  # Matches the namespace this cert lives in (region-a/region-b/
+  # region-05dc = the actual namespace name in every values file).
+  # Not used by Kafka's own TLS handshake  - SANs (dnsNames, below) are
+  # what that actually validates  - but org admission policies (e.g. a
+  # Kyverno rule tying a namespace's label to an allowed CN) may check
+  # this specifically as an identity-governance control, independent of
+  # anything Kafka itself cares about.
+  commonName: "{{ .Values.region.name }}"
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  commonName: {{ .Values.tls.certManager.kafka.commonName }} 
+  dnsNames:
+    {{- range .Values.tls.certManager.kafka.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: controlcenter-tls
+spec:
+  secretName: controlcenter-tls
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  commonName: {{ .Values.tls.certManager.controlcenter.commonName }} 
+  dnsNames:
+    {{- range .Values.tls.certManager.controlcenter.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kraftcontroller-tls
+spec:
+  secretName: kraftcontroller-tls
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  commonName: {{ .Values.tls.certManager.kraftController.commonName }}
+  dnsNames:
+    {{- range .Values.tls.certManager.kraftController.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: schemaeregistry-tls
+spec:
+  secretName: schemaeregistry-tls
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  commonName: {{ .Values.tls.certManager.schemaRegistry.commonName }}
+  dnsNames:
+    {{- range .Values.tls.certManager.schemaRegistry.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kafka-tls-translator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kafka-tls-translator
+rules:
+  # Scoped to only the one secret it needs to read and patch  - not a
+  # blanket grant on every secret in the namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.tls.secretRef | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kafka-tls-translator
+subjects:
+  - kind: ServiceAccount
+    name: kafka-tls-translator
+    namespace: {{ .Values.namespace }}
+roleRef:
+  kind: Role
+  name: kafka-tls-translator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kafka-tls-translator
+spec:
+  schedule: {{ .Values.tls.certManager.translator.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: kafka-tls-translator
+          restartPolicy: OnFailure
+          containers:
+            - name: translator
+              image: {{ .Values.tls.certManager.translator.image }}
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+
+                  NS={{ .Values.namespace | quote }}
+
+                  # cert-manager source Secrets
+                  SECRET_KAFKA={{ .Values.tls.secretRef | quote }}
+                  SECRET_C3=controlcenter-tls
+
+                  #
+                  # ---------------------------------------------------------
+                  # Kafka certificate
+                  # ---------------------------------------------------------
+                  #
+
+                  TLS_CRT_KAFKA=$(kubectl get secret "$SECRET_KAFKA" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.tls\.crt}')
+
+                  TLS_KEY_KAFKA=$(kubectl get secret "$SECRET_KAFKA" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.tls\.key}')
+
+                  CA_CRT_KAFKA=$(kubectl get secret "$SECRET_KAFKA" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.ca\.crt}')
+
+                  kubectl patch secret "$SECRET_KAFKA" \
+                    -n "$NS" \
+                    --type=merge \
+                    -p \
+                    "{\"data\":{
+                      \"fullchain.pem\":\"$TLS_CRT_KAFKA\",
+                      \"privkey.pem\":\"$TLS_KEY_KAFKA\",
+                      \"cacerts.pem\":\"$CA_CRT_KAFKA\"
+                    }}"
+
+                  echo "Translated $SECRET_KAFKA:"
+                  echo "  tls.crt -> fullchain.pem"
+                  echo "  tls.key -> privkey.pem"
+                  echo "  ca.crt  -> cacerts.pem"
+
+                  #
+                  # ---------------------------------------------------------
+                  # Control Center certificate
+                  # ---------------------------------------------------------
+                  #
+
+                  TLS_CRT_C3=$(kubectl get secret "$SECRET_C3" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.tls\.crt}')
+
+                  TLS_KEY_C3=$(kubectl get secret "$SECRET_C3" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.tls\.key}')
+
+                  CA_CRT_C3=$(kubectl get secret "$SECRET_C3" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.ca\.crt}')
+
+                  kubectl patch secret "$SECRET_C3" \
+                    -n "$NS" \
+                    --type=merge \
+                    -p \
+                    "{\"data\":{
+                      \"fullchain.pem\":\"$TLS_CRT_C3\",
+                      \"privkey.pem\":\"$TLS_KEY_C3\",
+                      \"cacerts.pem\":\"$CA_CRT_C3\"
+                    }}"
+
+                  echo "Translated $SECRET_C3:"
+                  echo "  tls.crt -> fullchain.pem"
+                  echo "  tls.key -> privkey.pem"
+                  echo "  ca.crt  -> cacerts.pem"
+
+                  echo "TLS translation completed successfully."
+
+                  #
+                  # ---------------------------------------------------------
+                  #  KRaft Controller certificate
+                  # ---------------------------------------------------------
+                  #
+                  SECRET_KRAFT=kraftcontroller-tls
+
+                  TLS_CRT_KRAFT=$(kubectl get secret "$SECRET_KRAFT" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.tls\.crt}')
+
+                  TLS_KEY_KRAFT=$(kubectl get secret "$SECRET_KRAFT" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.tls\.key}')
+
+                  CA_CRT_KRAFT=$(kubectl get secret "$SECRET_KRAFT" \
+                    -n "$NS" \
+                    -o jsonpath='{.data.ca\.crt}')
+
+                  kubectl patch secret "$SECRET_KRAFT" \
+                    -n "$NS" \
+                    --type=merge \
+                    -p \
+                    "{\"data\":{
+                      \"fullchain.pem\":\"$TLS_CRT_KRAFT\",
+                      \"privkey.pem\":\"$TLS_KEY_KRAFT\",
+                      \"cacerts.pem\":\"$CA_CRT_KRAFT\"
+                    }}"
+
+                    echo "Translated $SECRET_KRAFT:"
+                    echo "  tls.crt -> fullchain.pem"
+                    echo "  tls.key -> privkey.pem"
+                    echo "  ca.crt  -> cacerts.pem"
+                    
+                    # ---------------------------------------------------------
+                    # Schema Registry certificate
+                    # ---------------------------------------------------------
+
+                    SECRET_SR=schemaregistry-tls
+
+                    TLS_CRT_SR=$(kubectl get secret "$SECRET_SR" \
+                      -n "$NS" \
+                      -o jsonpath='{.data.tls\.crt}')
+
+                    TLS_KEY_SR=$(kubectl get secret "$SECRET_SR" \
+                      -n "$NS" \
+                      -o jsonpath='{.data.tls\.key}')
+
+                    CA_CRT_SR=$(kubectl get secret "$SECRET_SR" \
+                      -n "$NS" \
+                      -o jsonpath='{.data.ca\.crt}')
+
+                    kubectl patch secret "$SECRET_SR" \
+                      -n "$NS" \
+                      --type=merge \
+                      -p \
+                      "{\"data\":{
+                        \"fullchain.pem\":\"$TLS_CRT_SR\",
+                        \"privkey.pem\":\"$TLS_KEY_SR\",
+                        \"cacerts.pem\":\"$CA_CRT_SR\"
+                      }}"
+
+                    echo "Translated $SECRET_SR:"
+                    echo "  tls.crt -> fullchain.pem"
+                    echo "  tls.key -> privkey.pem"
+                    echo "  ca.crt  -> cacerts.pem"
+
+{{- end }}
+
