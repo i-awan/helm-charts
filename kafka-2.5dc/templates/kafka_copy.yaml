@@ -1,0 +1,62 @@
+spec:
+
+  authorization:
+    type: rbac
+    superUsers:
+      - User:kafka
+
+  tls:
+    enabled: true
+    secretRef: kafka-tls-cfk
+
+  configOverrides:
+    server:
+      - listener.name.token.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required publicKeyPath="/mnt/secrets/mds-token/mdsPublicKey.pem";
+      - listener.name.token.oauthbearer.sasl.login.callback.handler.class=io.confluent.kafka.server.plugins.auth.token.TokenBearerServerLoginCallbackHandler
+      - listener.name.token.oauthbearer.sasl.server.callback.handler.class=io.confluent.kafka.server.plugins.auth.token.TokenBearerValidatorCallbackHandler
+      - listener.name.token.sasl.enabled.mechanisms=OAUTHBEARER
+
+  services:
+    mds:
+      enabled: true
+      port: 8090
+
+      tls:
+        enabled: true
+
+      tokenKeyPair:
+        secretRef: mds-token
+
+      provider:
+        oidc:
+          clientCredentials:
+            secretRef: mds-oidc-client
+
+          configurations:
+            groupsClaimName: groups
+            subClaimName: sub
+            groupsClaimScope: groups
+
+            issuer: https://<KEYCLOAK_HOST>/realms/<REALM>
+
+            jwksEndpointUri: https://<KEYCLOAK_HOST>/realms/<REALM>/protocol/openid-connect/certs
+
+            authorizeBaseEndpointUri: https://<KEYCLOAK_HOST>/realms/<REALM>/protocol/openid-connect/auth
+
+            tokenBaseEndpointUri: https://<KEYCLOAK_HOST>/realms/<REALM>/protocol/openid-connect/token
+
+            refreshToken: true
+            sessionTokenExpiry: 900000
+            sessionMaxTimeout: 21600000
+
+  kafkaRest:
+    authentication:
+      type: mtls
+    tls:
+      enabled: true
+      secret: kafka-broker-cert
+
+  dependencies:
+    kafkaRest:
+      authentication:
+        type: mtlss
