@@ -1,0 +1,97 @@
+apiVersion: platform.confluent.io/v1beta1
+kind: SchemaRegistry
+metadata:
+  annotations:
+    meta.helm.sh/release-name: kafka
+    meta.helm.sh/release-namespace: kafka-region-a
+  creationTimestamp: "2026-09-24T03:20:16Z"
+  finalizers:
+  - schemaregistry.finalizers.platform.confluent.io
+  generation: 1
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  name: schemaregistry
+  namespace: kafka-region-a
+  resourceVersion: "448196"
+  uid: fd80d51d-bbae-46ce-91be-86578960785e
+spec:
+  dependencies:
+    kafka:
+      bootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9092
+      tls:
+        enabled: true
+        secretRef: kafka-tls
+  image:
+    application: confluentinc/cp-schema-registry:7.9.0
+    init: confluentinc/confluent-init-container:3.3.0
+  listeners:
+    internal:
+      tls:
+        enabled: true
+        secretRef: schemaregistry-tls
+  podTemplate:
+    resources:
+      limits:
+        cpu: 500m
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 512Mi
+  replicas: 1
+  tls:
+    secretRef: schemaregistry-tls
+status:
+  clusterName: schemaregistry
+  clusterNamespace: kafka-region-a
+  conditions:
+  - lastProbeTime: "2026-09-24T03:20:17Z"
+    lastTransitionTime: "2026-09-24T03:23:17Z"
+    message: 1 out of 1 replicas are not ready.
+    reason: ReplicasNotReady
+    status: "False"
+    type: platform.confluent.io/cluster-ready
+  - lastProbeTime: "2026-09-24T03:23:17Z"
+    lastTransitionTime: "2026-09-24T03:23:17Z"
+    message: 1 out of 1 replicas are not ready
+    reason: MinimumReplicasUnavailable
+    status: "False"
+    type: platform.confluent.io/statefulset-available
+  - lastProbeTime: "2026-09-24T03:23:17Z"
+    lastTransitionTime: "2026-09-24T03:23:17Z"
+    message: Kubernetes resources not ready.
+    reason: KubernetesResourcesNotReady
+    status: "False"
+    type: platform.confluent.io/resources-ready
+  - lastProbeTime: "2026-09-24T03:23:17Z"
+    lastTransitionTime: "2026-09-24T03:23:17Z"
+    message: Cluster is not being garbage collected
+    reason: Garbage Collection not triggered
+    status: "False"
+    type: platform.confluent.io/garbage-collecting
+  currentReplicas: 1
+  groupId: id_schemaregistry_kafka-region-a
+  internalSecrets:
+  - schemaregistry-kafka-tls-pkcs12
+  - schemaregistry-pkcs12
+  - schemaregistry-schemaregistry-tls-pkcs12
+  internalTopicNames:
+  - _schemas_schemaregistry_kafka-region-a
+  kafka:
+    bootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9092
+    tls: true
+  listeners:
+    external:
+      internalEndpoint: https://schemaregistry.kafka-region-a.svc.cluster.local:8081
+      tls: true
+    internal:
+      internalEndpoint: https://schemaregistry.kafka-region-a.svc.cluster.local:9081
+      tls: true
+  metricPrefix: schemaregistry_kafka-region-a
+  observedGeneration: 1
+  operatorVersion: v0.1718.10
+  phase: PROVISIONING
+  replicas: 1
+  restConfig:
+    internalEndpoint: https://schemaregistry.kafka-region-a.svc.cluster.local:8081
+    tls: true
+  selector: app=schemaregistry,clusterId=kafka-region-a,confluent-platform=true,type=schemaregistry

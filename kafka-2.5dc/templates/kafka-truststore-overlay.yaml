@@ -1,0 +1,91 @@
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-truststore-overlay
+  namespace: {{ .Values.namespace }}
+data:
+  pod-template.yaml: |
+    spec:
+      template:
+        spec:
+          volumes:
+            - name: kafka-pkcs12-source
+              secret:
+                secretName: kafka-pkcs12
+            - name: truststore-work
+              emptyDir: {}
+
+          initContainers:
+            - name: merge-custom-ca
+              image: {{ .Values.image.application }}
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  PASSWORD="$(cat /mnt/sslcerts/jksPassword.txt)"
+                  mkdir -p /work/certs
+                  cp /mnt/sslcerts/truststore.p12 /work/certs/truststore.p12
+
+                  awk '
+                    /-----BEGIN CERTIFICATE-----/ {
+                      n++
+                      file=sprintf("/work/certs/ca-%03d.pem", n)
+                    }
+                    file != "" { print > file }
+                    /-----END CERTIFICATE-----/ {
+                      close(file)
+                      file=""
+                    }
+                  ' /mnt/custom-ca/ca-bundle.crt
+
+                  found=0
+                  for cert in /work/certs/ca-*.pem; do
+                    [ -f "$cert" ] || continue
+                    found=1
+                    alias="openshift-$(basename "$cert" .pem)"
+
+                    keytool -importcert -noprompt \
+                      -trustcacerts \
+                      -alias "$alias" \
+                      -file "$cert" \
+                      -keystore /work/certs/truststore.p12 \
+                      -storetype PKCS12 \
+                      -storepass "$PASSWORD"
+                  done
+
+                  if [ "$found" -ne 1 ]; then
+                    echo "ERROR: No certificates found in CA bundle"
+                    exit 1
+                  fi
+
+                  keytool -list \
+                    -keystore /work/certs/truststore.p12 \
+                    -storetype PKCS12 \
+                    -storepass "$PASSWORD" >/dev/null
+
+                  unset PASSWORD
+                  echo "Custom CA import completed successfully"
+
+              volumeMounts:
+                - name: kafka-pkcs12-source
+                  mountPath: /mnt/sslcerts
+                  readOnly: true
+                - name: openshift-trusted-ca
+                  mountPath: /mnt/custom-ca
+                  readOnly: true
+                - name: truststore-work
+                  mountPath: /work
+
+          containers:
+            - name: REPLACE_WITH_ACTUAL_KAFKA_CONTAINER_NAME
+              volumeMounts:
+                - name: truststore-work
+                  mountPath: /mnt/sslcerts/truststore.p12
+                  subPath: certs/truststore.p12
+                  readOnly: true
+
+# metadata:
+#   annotations:
+#     platform.confluent.io/pod-overlay-configmap-name: kafka-truststore-overlay

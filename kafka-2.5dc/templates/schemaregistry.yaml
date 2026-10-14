@@ -3,7 +3,6 @@ apiVersion: platform.confluent.io/v1beta1
 kind: SchemaRegistry
 metadata:
   name: {{ .Values.schemaRegistry.name }}
-  namespace: {{ .Values.namespace }}
 spec:
   replicas: {{ .Values.schemaRegistry.replicas }}
   image:
@@ -11,12 +10,18 @@ spec:
     init: {{ .Values.schemaRegistry.image.init }}
   dependencies:
     kafka:
-      bootstrapEndpoint: {{ .Values.schemaRegistry.kafkaBootstrapEndpoint }}
+      bootstrapEndpoint: {{ .Values.kafka.kafkaBootstrapEndpoint }}
+
       {{- if .Values.tls.enabled }}
       tls:
         enabled: true
         secretRef: {{ .Values.tls.secretRef }}
       {{- end }}
+      {{- if .Values.tls.mtls.enabled }}
+      authentication:
+        type: mtls
+      {{- end }}
+
   podTemplate:
     resources:
       requests:
@@ -30,7 +35,7 @@ spec:
       topology.kubernetes.io/region: {{ .Values.region.name }}
     {{- end }}
     {{- if .Values.schemaRegistry.waitForKafka.enabled }}
-    {{- $kb := split ":" .Values.schemaRegistry.kafkaBootstrapEndpoint }}
+    {{- $kb := split ":" .Values.kafka.kafkaBootstrapEndpoint }}
     initContainers:
       # Blocks with a clean, expected "waiting for..." log line until
       # Kafka's listener is actually reachable, instead of letting the
@@ -45,7 +50,7 @@ spec:
           - -c
           - |
             until nc -z -w2 {{ $kb._0 }} {{ $kb._1 }}; do
-              echo "waiting for kafka at {{ .Values.schemaRegistry.kafkaBootstrapEndpoint }}..."
+              echo "waiting for kafka at {{ .Values.kafka.kafkaBootstrapEndpoint }}..."
               sleep 5
             done
             echo "kafka is reachable, continuing"

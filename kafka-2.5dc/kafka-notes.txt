@@ -43,5 +43,220 @@ kafka-avro-console-producer \
   --property schema.registry.ssl.keystore.location=/tmp/keystore.pem \
   --property schema.registry.ssl.keystore.type=PEM \
   --property value.schema='{"type":"record","name":"Payment","fields":[{"name":"id","type":"string"},{"name":"amount","type":"double"}]}'
-  
+
   {"id": "abc123", "amount": 42.50}
+
+
+
+  status:
+    listeners:
+        external:
+            client: |-
+                bootstrap.servers=kafka.<ns>.svc.cluster.local:9092
+                security.protocol=PLAINTEXT 
+            internalEndpoint: kafka.<ns>.svc.cluster.local:9092
+        internal:
+            authenticationType: mtls 
+            client: |-
+                bootstrap.servers=kafka.<ns>.svc.cluster.local:9071
+                security.protocol=SSL 
+                .....
+                ....
+            internalEndpoint: kafka.<ns>.svc.cluster.local:9071
+            tls: true 
+        replication:
+            authenticationType: mtls 
+            internalEndpoint: kafka.<ns>.svc.cluster.local:9072
+            tls: true 
+
+
+tls
+    directoryPathInContainer 
+    enabled 
+    ignoreGTrustStoreConfig 
+    jksPaasword 
+        secretRef 
+    secretRef
+
+
+
+OIDC (OpenID Connect) = an identity/authentication layer built on OAuth 2.0. It answers “Who is this user/client?”
+OAuth 2.0 = a token/authorisation framework. It answers “Here is a token proving this client has been authenticated/authorised.”
+Keycloak = your Identity Provider (IdP). It handles the login/identity side and issues OAuth/OIDC tokens.
+MDS (Metadata Service) = Confluent's RBAC/authorisation service. It receives/validates tokens and determines what identities are allowed to do in Kafka.
+C3 = the client that needs to authenticate to MDS.
+
+
+
+              Authentication
+                    │
+                    ▼
+             ┌─────────────┐
+             │  Keycloak   │
+             │    OIDC     │
+             └──────┬──────┘
+                    │
+              OAuth access token
+                    │
+                    ▼
+             ┌─────────────┐
+             │     C3      │
+             └──────┬──────┘
+                    │
+              token presented
+                    │
+                    ▼
+             ┌─────────────┐
+             │     MDS     │
+             │  Confluent  │
+             │    RBAC     │
+             └──────┬──────┘
+                    │
+             authorisation
+                    │
+                    ▼
+                Kafka
+
+
+
+Keycloak = identity provider
+OIDC = how C3/MDS integrate with Keycloak
+OAuth = the access-token mechanism
+MDS = Confluent's RBAC/authorisation layer
+Kafka = the resource being protected
+
+The confusing TOKEN listener/callback/JAAS stuff we've been dealing with is Kafka's own internal OAuth machinery needed when RBAC/MDS is enabled. It's separate from the basic concept of C3 authenticating against Keycloak.
+
+
+
+
+
+MDS
+ │
+ │ signs token
+ ▼
+Client/C3
+ │
+ │ token
+ ▼
+Kafka
+ │
+ │ verify token using mdsPublicKey.pem
+ │
+ │ evaluate RBAC
+ ▼
+ALLOW / DENY
+
+
+
+
+
+
+Alice
+  │
+  │ "I am Alice"
+  ▼
+Keycloak
+  │
+  │ Keycloak/OIDC token
+  │ "This is Alice, member of groups X/Y"
+  ▼
+C3
+  │
+  │ presents Keycloak identity to MDS
+  ▼
+MDS
+  │
+  │ validates/uses that identity
+  │
+  │ creates Confluent authentication context/token
+  ▼
+C3
+  │
+  │ MDS/Confluent token
+  ▼
+Kafka
+  │
+  │ validates token + RBAC
+  ▼
+ALLOW / DENY
+
+
+
+
+
+| Token                   | Issued by | Purpose                                                          |
+| ----------------------- | --------- | ---------------------------------------------------------------- |
+| **Keycloak OIDC token** | Keycloak  | Proves **who Alice is**                                          |
+| **MDS/Confluent token** | MDS       | Carries the identity into the **Confluent RBAC/security system** |
+
+
+
+
+The important concept is:
+
+Keycloak doesn't know Confluent RBAC.
+
+Keycloak might tell MDS:
+
+username = alice
+groups = [Kafka-Developers, Finance]
+
+MDS can then apply the Confluent RBAC model:
+
+Kafka-Developers
+    ↓
+DeveloperRole
+    ↓
+READ/WRITE topic orders
+
+The resulting Confluent security context can then be used by Kafka.
+
+And this explains mds-token
+
+Your:
+
+mdsTokenKeyPair.pem
+mdsPublicKey.pem
+
+is not related to Keycloak's signing keys.
+
+
+MDS
+  │
+  │ signs Confluent token
+  ▼
+C3 / client
+  │
+  │ presents token
+  ▼
+Kafka
+  │
+  │ verifies with mdsPublicKey.pem
+  ▼
+Trusted Confluent identity
+
+
+Keycloak = "Who are you?"
+MDS = "What does that identity mean in Confluent?"
+Kafka = "Are you allowed to perform this operation?"
+
+
+Bind a Confluent RBAC role to an identity/group whose membership originates from AD.
+
+
+helm upgrade kafka-helm helm-charts/kafka-2.5dc -f helm-charts/kafka-2.5dc/values-region-a.yaml
+
+
+kubectl get secrets -n "$NS" -o name \                                     
+  | grep '^secret/kafka' \
+  | while read -r secret; do
+      kubectl delete -n "$NS" "$secret"
+    done
+
+
+
+
+kubectl logs schemaregistry-0 --since=10m \
+  | grep -Ei 'SSLHandshakeException|PKIX|certificate|authentication|SASL'
+

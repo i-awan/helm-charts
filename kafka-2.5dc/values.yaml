@@ -5,7 +5,7 @@
 # values-standalone.yaml.
 # ---------------------------------------------------------------------------
 
-namespace: confluent
+namespace: kafka-region-a
 
 # Set true for a single-cluster test/dev install (see values-standalone.yaml).
 # Relaxes the two things that assume multi-cluster infra exists: region node
@@ -50,7 +50,7 @@ region:
 cluster:
   clusterID: ""   # leave blank on first bootstrap install, then fetch and reuse
   name: kafka
-  replicationFactor: 3
+  replicationFactor: 2
   minInsyncReplicas: 2
 
 # Lets a region-a consumer that sets client.rack=region-a on its own
@@ -83,33 +83,43 @@ image:
   controllerInit: confluentinc/confluent-init-container:3.3.0
 
 
+kafkaRestProxy:
+  enabled: false
+
+controlCenter:
+  name: controlcenter
+  enabled: true
+  replicas: 1
+  # Init container that blocks until Kafka's listener is reachable 
+
 kraftController:
   name: kraftcontroller
   replicas: 1
   storage:
     class: ""
-    size: 20Gi
+    size: 2Gi
   resources:
     requests:
-      cpu: "1"
-      memory: 2Gi
+      cpu: "100m"
+      memory: 256Mi
     limits:
-      cpu: "2"
-      memory: 4Gi
+      cpu: "500m"
+      memory: 512Mi
 
 kafka:
   name: kafka
-  replicas: 3
+  replicas: 1
   storage:
     class: ""
-    size: 500Gi
+    size: 2Gi
   resources:
     requests:
-      cpu: "2"
-      memory: 8Gi
+      cpu: "250m"
+      memory: 768Mi
     limits:
-      cpu: "4"
-      memory: 16Gi
+      cpu: "1"
+      memory: 1536Mi
+
   externalAccess:
     enabled: false
     type: loadBalancer   # loadBalancer | nodePort | route (route = OpenShift-native)
@@ -122,11 +132,7 @@ kafka:
       bootstrapPrefix: ""     # optional  - defaults exist in CFK if left blank
       brokerPrefix: ""        # optional  - broker DNS becomes <brokerPrefix>0.<domain>, etc.
       wildcardPolicy: ""      # optional
-
-tls:
-  enabled: true
-  secretRef: kafka-tls   # must be the SAME cert material, pre-created in every region's namespace
-                          # see scripts/generate-and-distribute-tls.sh
+  kafkaBootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9092
 
   # Alternative to the manual script above: let cert-manager issue and
   # auto-renew certs, backed by a SHARED root CA  - a plain per-region
@@ -152,24 +158,61 @@ tls:
   # The same translator CronJob as before bridges this by ADDING the
   # CFK-named keys onto the SAME Secret (no second secret, no changes
   # needed elsewhere in this chart).
+
+tls:
+  # Both flags needed together  - see values-region-a.yaml for why.
+  enabled: true
+  secretRef: kafka-tls
   certManager:
-    enabled: false
-    bootstrapRoot: false   # true on EXACTLY ONE region's values file  - see values-region-a.yaml
+    enabled: true
+    bootstrapRoot: true 
     rootSecretName: kafka-root-ca        # identical across every region's values file
     rootNamespace: kafka-region-a  
     kafka:      # the namespace bootstrapRoot:true is set in
+      commonName: kafka
       dnsNames:                # SANs for THIS region's leaf cert  - match its actual internal DNS
         - kafka.kafka-region-a.svc.cluster.local
+        - kafka-0.kafka.kafka-region-a.svc.cluster.local
+        - kafka-1.kafka.kafka-region-a.svc.cluster.local
+        - kafka-2.kafka.kafka-region-a.svc.cluster.local
+        - "*.kafka-region-a.svc.cluster.local"
+    controlcenter:      # the namespace bootstrapRoot:true is set in
+      commonName: controlcenter
+      dnsNames:                # SANs for THIS region's leaf cert  - match its actual internal DNS
+        - controlcenter.kafka-region-a..svc.cluster.local
+        - controlcenter-0.kafka-region-a..svc.cluster.local
         - "*.kafka-region-a.svc.cluster.local"
     kraftController:
-      # Controller service
-      - kraftcontroller.kafka-region-a.svc.cluster.local
-      # Controller StatefulSet pods
-      - kraftcontroller-0.kraftcontroller.kafka-region-a.svc.cluster.local
-      - kraftcontroller-1.kraftcontroller.kafka-region-a.svc.cluster.local
-      - kraftcontroller-2.kraftcontroller.kafka-region-a.svc.cluster.local
-      # Wildcard covers the controller pod names
-      - "*.kraftcontroller.kafka-region-a.svc.cluster.local"
+      commonName: kraftcontroller
+      dnsNames:
+        # Controller service
+        - kraftcontroller.kafka-region-a.svc.cluster.local
+        # Controller StatefulSet pods
+        - kraftcontroller-0.kraftcontroller.kafka-region-a.svc.cluster.local
+        - kraftcontroller-1.kraftcontroller.kafka-region-a.svc.cluster.local
+        - kraftcontroller-2.kraftcontroller.kafka-region-a.svc.cluster.local
+        # Wildcard covers the controller pod names
+        - "*.kraftcontroller.kafka-region-a.svc.cluster.local"
+    schemaRegistry:
+      commonName: schemaregistry
+      dnsNames:
+        # Controller service
+        - schemaregistry.kafka-region-a.svc.cluster.local
+        # Controller StatefulSet pods
+        - schemaregistry-0.kraftcontroller.kafka-region-a.svc.cluster.local
+        # Wildcard covers the controller pod names
+        - "*.schemaregistry.kafka-region-a.svc.cluster.local"
+    mds:
+      commonName: kafka-mds
+      dnsNames:     
+        - kafka-mds.kafka-region-a.svc.cluster.local
+    kafkarest:
+      commonName: kafka-rest
+      dnsNames:     
+        - kafka-rest
+        - kafka-rest.kafka-region-a.svc
+        - kafka-rest.kafka-region-a.svc.cluster.local
+
     translator:
       schedule: "*/10 * * * *"   # how often to re-sync the CFK-named keys; cheap to run often, cert-manager only writes new content on actual renewal
       image: alpine/k8s:1.29.15
@@ -185,14 +228,16 @@ tls:
   # whether the listener DEMANDS a peer cert; requires the shared-CA
   # pattern above so every peer's cert is actually verifiable.
   mtls:
-    enabled: true
+    enabled: false
 
+mds:
+  enabled: false
 # Simple ACL authorization (KRaft-compatible). This is the documented,
 # stable authorization path for KRaft-based CFK clusters. Full RBAC+MDS
 # in KRaft mode exists but is more version-sensitive across CFK releases
 #  - check current Confluent docs before switching to it.
 authorization:
-  enabled: true
+  enabled: false
   superUsers:
     - User:kafka   # the broker's own inter-broker principal  - must stay a super user
 
@@ -210,9 +255,9 @@ schemas:
   enabled: true
 
 schemaRegistry:
-  name: schemaeregistry
+  name: schemaregistry
   enabled: true
-  clusterRefName: schemaregistry   # must match metadata.name below
+  clusterRefName: kafka
   replicas: 1
   image:
     application: confluentinc/cp-schema-registry:7.9.0
@@ -225,7 +270,6 @@ schemaRegistry:
   # Schema Registry startup (KafkaException: Failed to create new
   # KafkaAdminClient)  - it fails fast rather than falling back to
   # anything, so this value must be exactly right.
-  kafkaBootstrapEndpoint: kafka.confluent.svc.cluster.local:9092
   # Init container that blocks until Kafka's listener is reachable before
   # the real schemaregistry container starts  - avoids a noisy crash-loop
   # while Kafka is still coming up (see templates/schemaregistry.yaml).
