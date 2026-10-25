@@ -1,0 +1,27 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.example.orders",
+  "fields": [
+    {"name": "order_id", "type": {"type": "string", "logicalType": "uuid"}},
+    {"name": "customer", "type": {
+      "type": "record", "name": "Customer",
+      "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "email", "type": "string"},
+        {"name": "tier", "type": {"type": "enum", "name": "Tier", "symbols": ["BRONZE", "SILVER", "GOLD"]}}
+      ]
+    }},
+    {"name": "items", "type": {"type": "array", "items": {
+      "type": "record", "name": "Item",
+      "fields": [
+        {"name": "sku", "type": "string"},
+        {"name": "quantity", "type": "int"},
+        {"name": "unit_price", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}
+      ]
+    }}},
+    {"name": "coupon", "type": ["null", "string"], "default": null},
+    {"name": "attributes", "type": {"type": "map", "values": "string"}},
+    {"name": "created_at", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

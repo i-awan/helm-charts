@@ -1,0 +1,14 @@
+{{- if .Values.test.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "ktc.fullname" . }}-roundtrip
+  labels:
+    {{- include "ktc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  {{- include "ktc.podSpec" (dict "root" . "mode" "roundtrip" "roleEnv" (include "ktc.testEnv" .) "restartPolicy" "Never" "resources" .Values.test.resources) | nindent 2 }}
+{{- end }}

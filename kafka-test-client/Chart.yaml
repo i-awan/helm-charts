@@ -1,0 +1,9 @@
+apiVersion: v2
+name: kafka-test-client
+description: >-
+  Test client for a Kafka cluster in the same Kubernetes cluster. Produces records that
+  conform to a schema you pass in (Avro or JSON Schema), consumes and validates them, and
+  ships a `helm test` produce-then-consume check.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

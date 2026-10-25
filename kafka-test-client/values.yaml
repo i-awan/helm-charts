@@ -1,0 +1,161 @@
+# kafka-test-client
+#
+# Minimum to install:
+#   helm install t ./kafka-test-client \
+#     --set image.repository=<registry>/kafka-test-client \
+#     --set kafka.bootstrapServers=kafka.<ns>.svc.cluster.local:9092 \
+#     --set topic.name=orders \
+#     --set-file schema.inline=./examples/order.avsc
+# (the image is built from image/Dockerfile - see README)
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ""            # REQUIRED - where you pushed the image built from image/
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccountName: ""      # optional; the pods need no Kubernetes API access
+
+# ---------------------------------------------------------------------------
+# Kafka connection (client runs in the same cluster, so use the in-cluster service)
+# ---------------------------------------------------------------------------
+kafka:
+  bootstrapServers: ""      # REQUIRED, e.g. kafka.kafka-region-a.svc.cluster.local:9092
+  securityProtocol: SSL     # PLAINTEXT | SSL | SASL_SSL | SASL_PLAINTEXT
+
+  # Used when securityProtocol is SSL or SASL_SSL.
+  # existingSecret is a Secret holding the CA (and, for mTLS, a client cert + key) as PEM.
+  # The defaults match what cert-manager writes (ca.crt / tls.crt / tls.key).
+  tls:
+    existingSecret: ""      # e.g. kafka-tls ; leave empty to use the image's system CAs
+    caKey: ca.crt
+    certKey: tls.crt
+    keyKey: tls.key
+    mutual: false           # true = also present tls.crt/tls.key (client authentication)
+    verifyHostname: true    # false = ssl.endpoint.identification.algorithm=none
+
+  # Used when securityProtocol is SASL_*.  existingSecret holds the credentials.
+  sasl:
+    mechanism: ""           # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512 | OAUTHBEARER
+    existingSecret: ""
+    usernameKey: username   # PLAIN / SCRAM
+    passwordKey: password
+    oauth:                  # OAUTHBEARER (client-credentials against an OIDC token endpoint)
+      tokenEndpointUrl: ""
+      scope: ""
+      clientIdKey: clientId
+      clientSecretKey: clientSecret
+      # If the token endpoint (e.g. Keycloak) uses a different CA than Kafka, add the property
+      #   https.ca.location: /path/to/ca.pem
+      # to extraProperties below and mount that CA with extraVolumes/extraVolumeMounts.
+
+  extraProperties: {}       # any raw librdkafka property, applied to producer and consumer
+
+# ---------------------------------------------------------------------------
+# The schema the produced data must conform to
+# ---------------------------------------------------------------------------
+schema:
+  format: avro              # avro | jsonschema
+  # Pass the schema in ONE of these ways:
+  inline: ""                #   helm install ... --set-file schema.inline=./order.avsc
+  existingConfigMap: ""     #   or reference a ConfigMap you already have ...
+  existingConfigMapKey: schema   # ... and the key inside it
+
+schemaRegistry:
+  enabled: true             # true: Confluent wire format via Schema Registry. false: raw Avro / plain JSON.
+  url: ""                   # REQUIRED when enabled, e.g. https://schemaregistry.<ns>.svc.cluster.local:8081
+  subject: ""               # default: <topic>-value
+  autoRegister: true        # false = the schema must already be registered (e.g. by a CFK Schema CR)
+  useLatestVersion: false   # true = use the latest registered version for the subject
+  mutualTls: false          # true = present kafka.tls cert/key to the registry too
+  # The kafka.tls CA is reused for an https registry URL.
+  basicAuth:
+    existingSecret: ""      # Secret with a "user:password" value
+    key: basic-auth
+
+# ---------------------------------------------------------------------------
+# Topic
+# ---------------------------------------------------------------------------
+topic:
+  name: test-topic
+  create: false             # true = create it if missing (needs permission to)
+  partitions: 3
+  replicationFactor: 3
+  config: {}                # e.g. { "min.insync.replicas": "2" }
+
+# ---------------------------------------------------------------------------
+# Producer
+# ---------------------------------------------------------------------------
+producer:
+  enabled: true
+  kind: Job                 # Job (finite) | Deployment (run until stopped)
+  messageCount: 100         # 0 = unlimited (requires kind: Deployment)
+  ratePerSecond: 10         # 0 = as fast as possible
+  key: uuid                 # none | uuid | sequence | field:<top-level field> | fixed:<value>
+  seed: ""                  # set a number for reproducible data
+  acks: all
+  extraProperties: {}
+  replicas: 1               # Deployment only
+  backoffLimit: 0           # Job only
+  ttlSecondsAfterFinished: 3600
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# ---------------------------------------------------------------------------
+# Consumer
+# ---------------------------------------------------------------------------
+consumer:
+  enabled: true
+  kind: Deployment          # Deployment | Job (a Job needs maxMessages or idleTimeoutSeconds > 0)
+  groupId: ""               # default: <release>-consumer
+  autoOffsetReset: earliest
+  maxMessages: 0            # stop after this many (0 = never)
+  idleTimeoutSeconds: 0     # stop after this long with no messages (0 = never)
+  failOnInvalid: true       # exit non-zero if any record does not decode / conform
+  replicas: 1               # Deployment only
+  backoffLimit: 0           # Job only
+  ttlSecondsAfterFinished: 3600
+  extraProperties: {}
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# ---------------------------------------------------------------------------
+# `helm test`: produce N records, then read exactly those back and check they conform
+# ---------------------------------------------------------------------------
+test:
+  enabled: true
+  messageCount: 10
+  timeoutSeconds: 120
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+logLevel: INFO
+logSamples: 3               # how many records to print in full at the start
+extraEnv: []                # extra container env entries (YAML list)
+extraVolumes: []
+extraVolumeMounts: []
+
+# Restricted-SCC / "restricted" Pod Security friendly. No fsGroup or runAsUser is set so
+# OpenShift can assign its own; the TLS Secret is mounted world-readable (inside the pod only).
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

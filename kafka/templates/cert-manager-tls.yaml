@@ -1,0 +1,77 @@
+{{- if .Values.tls.certManager.enabled }}
+# `ca`-type Issuer, referencing the shared root CA Secret  - LOCAL to
+# this namespace either way: bootstrapped directly here if this is the
+# root region (cert-manager-root-ca.yaml), or copied in by the
+# distributor CronJob if not (cert-manager-ca-distributor.yaml). Never
+# `selfSigned` here  - that's what breaks cross-region trust; see the
+# comment on tls.certManager in values.yaml for the full reasoning.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kafka-tls-issuer
+  namespace: {{ .Values.namespace }}
+spec:
+  ca:
+    secretName: {{ .Values.tls.certManager.rootSecretName }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kafka-tls-cert
+  namespace: {{ .Values.namespace }}
+spec:
+  # Same name as tls.secretRef  - nothing else in this chart needs to
+  # change. CFK reads cert-manager's native keys (ca.crt/tls.crt/tls.key).
+  secretName: {{ .Values.tls.secretRef }}
+  # Matches the namespace this cert lives in (region-a/region-b/
+  # region-05dc = the actual namespace name in every values file).
+  # Not used by Kafka's own TLS handshake  - SANs (dnsNames, below) are
+  # what that actually validates  - but org admission policies (e.g. a
+  # Kyverno rule tying a namespace's label to an allowed CN) may check
+  # this specifically as an identity-governance control, independent of
+  # anything Kafka itself cares about.
+  commonName: {{ .Values.region.name }}
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  dnsNames:
+    {{- range .Values.tls.certManager.dnsNames }}
+    # Quoted deliberately: entries like "*.kafka-region-a.svc.cluster.local"
+    # start with a YAML-reserved character (*, used for anchors/aliases)
+    # - unquoted, this breaks YAML parsing on the RENDERED output, even
+    # though the source values.yaml entry itself is validly quoted there.
+    - {{ . | quote }}
+    {{- end }}
+    # Computed, not manually listed: a wildcard SAN only matches ONE DNS
+    # label deep, but per-pod StatefulSet hostnames (kafka-0.kafka....)
+    # are TWO labels deep - the wildcard above genuinely does not cover
+    # them. This matters because staticQuorumVoters dials controllers by
+    # their exact per-pod address, and real broker traffic (once past
+    # the initial bootstrap step) does the same - both would fail
+    # hostname verification without this. Generated from replica counts
+    # so it never drifts out of sync if you scale replicas up or down.
+    {{- if eq .Values.region.mode "full" }}
+    {{- range $i := until (int .Values.kafka.replicas) }}
+    - {{ printf "kafka-%d.kafka.%s.svc.cluster.local" $i $.Values.namespace | quote }}
+    {{- end }}
+    {{- if not .Values.tls.certManager.serviceCerts.enabled }}
+    {{- range $i := until (int .Values.schemaRegistry.replicas) }}
+    - {{ printf "schemaregistry-%d.schemaregistry.%s.svc.cluster.local" $i $.Values.namespace | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $i := until (int .Values.kraftController.replicas) }}
+    - {{ printf "kraftcontroller-%s-%d.kraftcontroller-%s.%s.svc.cluster.local" $.Values.region.name $i $.Values.region.name $.Values.namespace | quote }}
+    {{- end }}
+    {{- if and .Values.controlCenter.enabled (not .Values.tls.certManager.serviceCerts.enabled) }}
+    # (With tls.certManager.serviceCerts.enabled, C3 and Schema Registry get
+    # their own certificates instead - see cert-manager-service-certs.yaml.)
+    # Same computed-not-manual reasoning as above - CC only ever runs in
+    # the one region with controlCenter.enabled: true, so this is a no-op
+    # everywhere else.
+    {{- range $i := until (int .Values.controlCenter.replicas) }}
+    - {{ printf "%s-%d.%s.%s.svc.cluster.local" $.Values.controlCenter.clusterRefName $i $.Values.controlCenter.clusterRefName $.Values.namespace | quote }}
+    {{- end }}
+    - {{ printf "%s.%s.svc.cluster.local" $.Values.controlCenter.clusterRefName $.Values.namespace | quote }}
+    {{- end }}
+{{- end }}

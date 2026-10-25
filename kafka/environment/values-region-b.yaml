@@ -1,0 +1,104 @@
+# region-b  - full region (brokers + controller). Install AFTER region-a,
+# once you've fetched its clusterID and pasted it below.
+
+namespace: kafka-region-b
+
+region:
+  name: region-b
+  mode: full
+
+tls:
+  # Both flags needed together  - see values-region-a.yaml for why.
+  enabled: true
+  # Mutual TLS on the broker/controller listeners - must be true on EVERY
+  # region's values file (peers verify each other across regions).
+  mtls:
+    enabled: true
+  certManager:
+    enabled: true   # must be true on EVERY region's values file
+    # bootstrapRoot stays false here  - region-a is the root.
+    dnsNames:
+      - kafka.kafka-region-b.svc.cluster.local
+      - "*.kafka-region-b.svc.cluster.local"
+    # Schema Registry and Control Center get their own certificates
+    # (own CN/SANs, same issuer). Same value in every region.
+    serviceCerts:
+      enabled: true
+authorization:
+  enabled: true
+  # Principals are the cert CNs (see tls.mtls.principalMappingRules). Every
+  # broker/controller must be a super user on every node, so the list is the
+  # same in all three regional files. Schema Registry and C3 are super users
+  # here for simplicity; replace with scoped ACLs/RBAC when hardening.
+  superUsers:
+    - User:region-a
+    - User:region-b
+    - User:region-05dc
+    - User:region-a-schemaregistry
+    - User:region-b-schemaregistry
+    - User:region-a-controlcenter
+
+controllerIdOffset: 200
+brokerIdOffset: 210
+
+# Paste the clusterID fetched from region-a here before installing.
+cluster:
+  clusterID: "NWNkODNlMDMtOGMxMS00Mw"
+  replicationFactor: 2   # 1 broker per region x 2 regions; must be identical in every region's file
+
+# Identical to region-a's list  - every controller, every region. Same
+# internal-DNS caveat: correct for namespaces-on-one-cluster, needs real
+# cross-cluster addresses once region-a/b/05dc are genuinely separate
+# clusters.
+staticQuorumVoters:
+  - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
+    nodeId: 100
+  - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
+    nodeId: 200
+  - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
+    nodeId: 300
+
+schemaRegistry:
+  kafkaBootstrapEndpoint: kafka.kafka-region-b.svc.cluster.local:9071
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 384Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kraftController:
+  replicas: 1   # 1+1+1 topology (3 voters, majority 2) - see README quorum-survival section
+  storage:
+    class: ""
+    size: 2Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kafka:
+  replicas: 1   # one broker per region (2 brokers total across region-a/b)
+  storage:
+    class: ""
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  externalAccess:
+    enabled: false
+
+nodeSelector:
+  enabled: false
+
+# Topics are created from region-a only (see topics/ and values.yaml topics:).
+topics:
+  enabled: false

@@ -1,0 +1,235 @@
+{{- if eq .Values.region.mode "full" }}
+apiVersion: platform.confluent.io/v1beta1
+kind: Kafka
+metadata:
+  name: {{ .Values.cluster.name }}
+  namespace: {{ .Values.namespace }}
+  annotations:
+    platform.confluent.io/broker-id-offset: {{ .Values.brokerIdOffset | quote }}
+spec:
+  replicas: {{ .Values.kafka.replicas }}
+  image:
+    application: {{ .Values.image.application }}
+    init: {{ .Values.image.init }}
+  dataVolumeCapacity: {{ .Values.kafka.storage.size }}
+  {{- if .Values.kafka.storage.class }}
+  storageClass:
+    name: {{ .Values.kafka.storage.class }}
+  {{- end }}
+  dependencies:
+    kRaftController:
+      clusterRef:
+        name: {{ include "kafka-2.5dc.controllerName" . }}
+        namespace: {{ .Values.namespace }}
+      {{- if .Values.tls.enabled }}
+      # Required by CFK whenever the KRaftController's own controller
+      # listener has TLS enabled  - this is NOT inherited automatically
+      # via clusterRef, and must be configured identically to the
+      # KRaftController CR's listeners.controller.tls block, or the
+      # broker connects to the controller port in plaintext and fails
+      # with "Unrecognized SSL message, plaintext connection?"
+      controllerListener:
+        tls:
+          enabled: true
+      {{- end }}
+  {{- if .Values.authorization.enabled }}
+  authorization:
+    type: simple
+    superUsers:
+      {{- range .Values.authorization.superUsers }}
+      - {{ . | quote }}
+      {{- end }}
+  {{- end }}
+  {{- if and .Values.oauth.enabled .Values.oauth.clientSecretRef }}
+  # Mounts the pre-created client-secret Secret at
+  # /mnt/secrets/<clientSecretRef> (a directory, one file per key - a
+  # standard Secret volume mount), read at runtime via the
+  # ${directory:...} config-provider reference below - the actual
+  # secret value never appears in this CR.
+  mountedSecrets:
+    - {{ .Values.oauth.clientSecretRef }}
+  {{- end }}
+  podTemplate:
+    resources:
+      requests:
+        cpu: {{ .Values.kafka.resources.requests.cpu | quote }}
+        memory: {{ .Values.kafka.resources.requests.memory | quote }}
+      limits:
+        cpu: {{ .Values.kafka.resources.limits.cpu | quote }}
+        memory: {{ .Values.kafka.resources.limits.memory | quote }}
+    affinity:
+      podAntiAffinity:
+        {{- if not .Values.nodeSelector.enabled }}
+        # Soft preference when nodeSelector.enabled: false  - same
+        # reasoning as the KRaftController template.
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: kafka
+              topologyKey: kubernetes.io/hostname
+        {{- else }}
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: kafka
+            topologyKey: kubernetes.io/hostname
+        {{- end }}
+    {{- if and (not .Values.standalone) .Values.nodeSelector.enabled }}
+    nodeSelector:
+      # Requires nodes in this cluster to be labeled:
+      #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}
+      topology.kubernetes.io/region: {{ .Values.region.name }}
+    {{- end }}
+  configOverrides:
+    server:
+      # Rack awareness: ties replica placement to the region label above,
+      # so partition replicas spread across regions, not just brokers.
+      - broker.rack={{ .Values.region.name }}
+      {{- if .Values.rackAwareFetching.enabled }}
+      # Lets a consumer that sets client.rack=<region> fetch from a LOCAL
+      # replica (leader or follower) instead of always crossing to
+      # whichever broker leads the partition. This is a preference, not
+      # a guarantee  - falls back to the leader if no local replica
+      # exists. Produce is unaffected: producers always write to the
+      # leader regardless of region, since only the leader accepts
+      # writes at all. Client apps must set client.rack themselves  -
+      # nothing server-side can force this on an unconfigured consumer.
+      - replica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector
+      {{- end }}
+      - default.replication.factor={{ .Values.cluster.replicationFactor }}
+      - min.insync.replicas={{ .Values.cluster.minInsyncReplicas }}
+      # Internal topics default to RF 3 and would fail to create on a small
+      # cluster; follow cluster.replicationFactor instead.
+      - offsets.topic.replication.factor={{ .Values.cluster.replicationFactor }}
+      - transaction.state.log.replication.factor={{ .Values.cluster.replicationFactor }}
+      - transaction.state.log.min.isr={{ .Values.cluster.minInsyncReplicas }}
+      - confluent.license.topic.replication.factor={{ .Values.cluster.replicationFactor }}
+      # Never promote an out-of-sync replica  - see conversation notes on
+      # why this must stay false for a stretched cluster.
+      - unclean.leader.election.enable=false
+      {{- if .Values.tls.mtls.enabled }}
+      # Mutual TLS: demands the CONNECTING side also present a valid
+      # cert on the internal listener (client traffic + inter-broker
+      # replication both ride this listener in this chart). Requires
+      # the shared-CA pattern (tls.certManager) so every peer's cert is
+      # actually verifiable  - a per-region SelfSigned cert would make
+      # every OTHER region's broker fail this check.
+      - listener.name.internal.ssl.client.auth=required
+      - {{ printf "ssl.principal.mapping.rules=%s" .Values.tls.mtls.principalMappingRules | quote }}
+      {{- end }}
+      {{- if and .Values.tls.mtls.enabled .Values.kafka.externalAccess.enabled }}
+      # Same demand on the EXTERNAL listener  - without this, an
+      # external client only ever does one-way TLS (verifies the
+      # broker's cert, presents nothing of its own), regardless of
+      # tls.mtls.enabled, since that flag alone only touched the
+      # internal/controller listeners above. Gated on externalAccess
+      # being enabled too - there's no external listener to configure
+      # otherwise.
+      - listener.name.external.ssl.client.auth=required
+      {{- end }}
+      {{- if .Values.authorization.enabled }}
+      - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      - confluent.authorizer.access.rule.providers=KRAFT_ACL
+      # super.users is ONE semicolon-separated property; repeating the key per user
+      # keeps only the last one.
+      - super.users={{ join ";" .Values.authorization.superUsers }}
+      {{- end }}
+      {{- if .Values.oauth.enabled }}
+      # Mechanism selection - inter-broker traffic on the internal
+      # listener authenticates via OAUTHBEARER too, not just external
+      # clients.
+      # Scoped to the listener(s) this chart owns, NOT the global
+      # sasl.enabled.mechanisms: a global setting forces an OAUTHBEARER
+      # login on EVERY SASL listener, including any CFK adds itself
+      # (e.g. for MDS), and a listener with no login callback handler
+      # falls back to Kafka's default handler, which throws
+      # "Unrecognized SASL Login callback" on the OAuth token request.
+      - listener.name.{{ .Values.oauth.listenerName }}.sasl.enabled.mechanisms=OAUTHBEARER
+      - sasl.mechanism.inter.broker.protocol=OAUTHBEARER
+      # Broker -> controller client. In KRaft this outbound connection
+      # logs in under the CONTROLLER listener's name, so it needs its
+      # own copy of the client-side login config; the internal-listener
+      # lines below don't cover it.
+      - sasl.mechanism.controller.protocol=OAUTHBEARER
+      {{- if .Values.oauth.clientSecretRef }}
+      # Registers the ${directory:...} placeholder used below. A
+      # Kubernetes Secret volume mount (what mountedSecrets produces)
+      # creates a DIRECTORY with one plain file per key
+      # (/mnt/secrets/<name>/<key>) - it is NOT a Java properties file,
+      # so FileConfigProvider is the wrong provider here even though
+      # it's the one usually shown in Kafka's own OAuth docs.
+      # DirectoryConfigProvider is the one that matches this mount
+      # shape. Without this line registered, "${directory:...}" is
+      # never substituted and the literal placeholder string gets used
+      # as the client secret - which is what was happening here,
+      # surfacing as a generic wrapped LoginException with no clearer
+      # message.
+      - config.providers=directory
+      - config.providers.directory.class=org.apache.kafka.common.config.provider.DirectoryConfigProvider
+      {{- end }}
+      # SERVER side - validates tokens presented TO this broker.
+      - listener.name.{{ .Values.oauth.listenerName }}.oauthbearer.sasl.server.callback.handler.class={{ .Values.oauth.serverLoginCallbackHandlerClass }}
+      # CLIENT side - lets this broker fetch its OWN token when it
+      # initiates a connection outward (inter-broker traffic). Easy to
+      # miss: the server-side handler alone only covers inbound auth.
+      - listener.name.{{ .Values.oauth.listenerName }}.oauthbearer.sasl.login.callback.handler.class={{ .Values.oauth.clientLoginCallbackHandlerClass }}
+      {{- if .Values.oauth.clientSecretRef }}
+      - listener.name.{{ .Values.oauth.listenerName }}.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId="{{ .Values.oauth.clientId }}" clientSecret="${directory:/mnt/secrets/{{ .Values.oauth.clientSecretRef }}:{{ .Values.oauth.clientSecretKey }}}";
+      {{- end }}
+      - listener.name.{{ .Values.oauth.listenerName }}.oauthbearer.sasl.oauthbearer.token.endpoint.url={{ .Values.oauth.tokenEndpointUrl }}
+      # Same client-side login trio for the broker -> controller path.
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.login.callback.handler.class={{ .Values.oauth.clientLoginCallbackHandlerClass }}
+      {{- if .Values.oauth.clientSecretRef }}
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId="{{ .Values.oauth.clientId }}" clientSecret="${directory:/mnt/secrets/{{ .Values.oauth.clientSecretRef }}:{{ .Values.oauth.clientSecretKey }}}";
+      {{- end }}
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.oauthbearer.token.endpoint.url={{ .Values.oauth.tokenEndpointUrl }}
+      {{- end }}
+  listeners:
+    internal:
+      tls:
+        enabled: {{ .Values.tls.enabled }}
+        {{- if .Values.tls.enabled }}
+        secretRef: {{ .Values.tls.secretRef }}
+        {{- end }}
+    {{- if .Values.kafka.externalAccess.enabled }}
+    external:
+      externalAccess:
+        type: {{ .Values.kafka.externalAccess.type }}
+        {{- if eq .Values.kafka.externalAccess.type "loadBalancer" }}
+        loadBalancer:
+          domain: {{ .Values.kafka.externalAccess.domain }}
+        {{- else if eq .Values.kafka.externalAccess.type "nodePort" }}
+        # No SNI/hostname routing needed  - each broker gets its own raw
+        # TCP port directly on the node, starting from nodePortOffset.
+        # TLS isn't structurally required for this to route correctly
+        # (unlike loadBalancer/route, which need TLS for SNI to work)  -
+        # though you'll still want it for anything beyond local testing.
+        nodePort:
+          nodePortOffset: {{ .Values.kafka.externalAccess.nodePort.nodePortOffset }}
+          host: {{ .Values.kafka.externalAccess.nodePort.host }}
+        {{- else if eq .Values.kafka.externalAccess.type "route" }}
+        # OpenShift-native. Requires TLS (routes use SNI to pick the
+        # right per-broker backend, which needs a TLS handshake to
+        # inspect)  - set tls.enabled: true or this won't route
+        # correctly. CFK creates N+1 Route objects (bootstrap + one per
+        # broker); you still need real DNS entries pointing each
+        # resulting hostname at your OpenShift router  - CFK doesn't
+        # manage DNS itself.
+        route:
+          domain: {{ .Values.kafka.externalAccess.route.domain }}
+          {{- if .Values.kafka.externalAccess.route.bootstrapPrefix }}
+          bootstrapPrefix: {{ .Values.kafka.externalAccess.route.bootstrapPrefix }}
+          {{- end }}
+          {{- if .Values.kafka.externalAccess.route.brokerPrefix }}
+          brokerPrefix: {{ .Values.kafka.externalAccess.route.brokerPrefix }}
+          {{- end }}
+          {{- if .Values.kafka.externalAccess.route.wildcardPolicy }}
+          wildcardPolicy: {{ .Values.kafka.externalAccess.route.wildcardPolicy }}
+          {{- end }}
+        {{- end }}
+      tls:
+        enabled: {{ .Values.tls.enabled }}
+    {{- end }}
+{{- end }}

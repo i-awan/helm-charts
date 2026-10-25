@@ -1,0 +1,55 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled .Values.tls.certManager.serviceCerts.enabled }}
+{{- $sc := .Values.tls.certManager.serviceCerts }}
+{{- if and .Values.schemaRegistry.enabled (eq .Values.region.mode "full") (not .Values.tls.schemaRegistry.secretRef) }}
+{{- $n := .Values.schemaRegistry.clusterRefName }}
+# Schema Registry's own certificate. Same issuer (and so same root) as the
+# broker cert; only the identity (CN) and SANs differ.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kafka-schemaregistry-cert
+  namespace: {{ .Values.namespace }}
+spec:
+  secretName: {{ $sc.schemaRegistry.secretName }}
+  commonName: {{ $sc.schemaRegistry.commonName | default (printf "%s-schemaregistry" .Values.region.name) | quote }}
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  dnsNames:
+    - {{ printf "%s.%s.svc.cluster.local" $n .Values.namespace | quote }}
+    - {{ printf "%s.%s.svc" $n .Values.namespace | quote }}
+    {{- range $i := until (int .Values.schemaRegistry.replicas) }}
+    - {{ printf "%s-%d.%s.%s.svc.cluster.local" $n $i $n $.Values.namespace | quote }}
+    {{- end }}
+    {{- range $sc.schemaRegistry.extraDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+---
+{{- end }}
+{{- if and .Values.controlCenter.enabled (not .Values.tls.controlCenter.secretRef) }}
+{{- $n := .Values.controlCenter.clusterRefName }}
+# Control Center's own certificate. Used for BOTH its UI listener and its
+# client connections to Kafka / Schema Registry. If you expose the UI through
+# a Route that passes TLS through, add the Route host to extraDnsNames.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kafka-controlcenter-cert
+  namespace: {{ .Values.namespace }}
+spec:
+  secretName: {{ $sc.controlCenter.secretName }}
+  commonName: {{ $sc.controlCenter.commonName | default (printf "%s-controlcenter" .Values.region.name) | quote }}
+  issuerRef:
+    name: kafka-tls-issuer
+    kind: Issuer
+  dnsNames:
+    - {{ printf "%s.%s.svc.cluster.local" $n .Values.namespace | quote }}
+    - {{ printf "%s.%s.svc" $n .Values.namespace | quote }}
+    {{- range $i := until (int .Values.controlCenter.replicas) }}
+    - {{ printf "%s-%d.%s.%s.svc.cluster.local" $n $i $n $.Values.namespace | quote }}
+    {{- end }}
+    {{- range $sc.controlCenter.extraDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}

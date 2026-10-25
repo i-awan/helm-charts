@@ -1,0 +1,105 @@
+{{- if and .Values.tls.certManager.enabled (not .Values.tls.certManager.bootstrapRoot) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kafka-root-ca-distributor
+  namespace: {{ .Values.namespace }}
+---
+# Cluster-scoped read is unavoidable here  - the root CA Secret lives in
+# a DIFFERENT namespace than this region. Scoped as tightly as RBAC
+# allows: get-only, and only for a Secret with this exact name,
+# Named per-region, NOT shared: a fixed shared name here breaks a
+# second region's `helm install` outright, since Helm refuses to let a
+# different release "adopt" a cluster-scoped object another release
+# already owns, even with byte-identical content (confirmed - this
+# broke installing region-05dc after region-b already created it).
+# ClusterRoles are cheap (pure RBAC, no real resource cost), so one per
+# region is the simplest fix, matching the ClusterRoleBinding below,
+# which was already correctly named this way.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kafka-root-ca-reader-{{ .Values.region.name }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.tls.certManager.rootSecretName | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kafka-root-ca-reader-{{ .Values.region.name }}
+subjects:
+  - kind: ServiceAccount
+    name: kafka-root-ca-distributor
+    namespace: {{ .Values.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: kafka-root-ca-reader-{{ .Values.region.name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kafka-root-ca-writer
+  namespace: {{ .Values.namespace }}
+rules:
+  # "create" can't be scoped by resourceNames (the object doesn't exist
+  # yet the first time)  - get/update/patch are, once it does.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.tls.certManager.rootSecretName | quote }}]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kafka-root-ca-writer
+  namespace: {{ .Values.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: kafka-root-ca-distributor
+    namespace: {{ .Values.namespace }}
+roleRef:
+  kind: Role
+  name: kafka-root-ca-writer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kafka-root-ca-distributor
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.tls.certManager.distributor.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: kafka-root-ca-distributor
+          restartPolicy: OnFailure
+          containers:
+            - name: distributor
+              image: {{ .Values.tls.certManager.distributor.image }}
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  ROOT_NS={{ .Values.tls.certManager.rootNamespace | quote }}
+                  SECRET={{ .Values.tls.certManager.rootSecretName | quote }}
+                  NS={{ .Values.namespace | quote }}
+                  # Strip fields that are specific to the SOURCE object
+                  # (namespace, resourceVersion, uid, etc.)  - kubectl
+                  # apply would otherwise reject or mis-target the copy.
+                  # No jq dependency  - plain grep keeps this portable
+                  # across whatever image is configured above.
+                  kubectl get secret "$SECRET" -n "$ROOT_NS" -o yaml \
+                    | grep -v -E '^\s*(namespace|resourceVersion|uid|creationTimestamp|selfLink):' \
+                    | kubectl apply -n "$NS" -f -
+                  echo "root CA '$SECRET' synced from $ROOT_NS into $NS"
+{{- end }}

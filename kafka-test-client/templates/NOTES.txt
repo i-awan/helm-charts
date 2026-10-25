@@ -1,0 +1,22 @@
+kafka-test-client {{ .Release.Name }} installed in namespace {{ .Release.Namespace }}.
+
+  Kafka:   {{ .Values.kafka.bootstrapServers }}  ({{ .Values.kafka.securityProtocol }})
+  Topic:   {{ .Values.topic.name }}
+  Schema:  {{ .Values.schema.format }}{{ if .Values.schemaRegistry.enabled }}, via Schema Registry {{ .Values.schemaRegistry.url }}{{ else }}, no Schema Registry{{ end }}
+
+Round-trip test (preflight checks, then produce {{ .Values.test.messageCount }}, read exactly those back, validate each):
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs
+{{- if .Values.producer.enabled }}
+
+Producer ({{ .Values.producer.kind }}):
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=producer --tail=50
+{{- end }}
+{{- if .Values.consumer.enabled }}
+
+Consumer ({{ .Values.consumer.kind }}):
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=consumer --tail=50
+{{- end }}
+
+To see the kind of record your schema produces, without any Kafka, run the script locally:
+  pip install "confluent-kafka[avro,json,schemaregistry]" fastavro jsonschema exrex
+  SCHEMA_PATH=./your-schema SCHEMA_FORMAT={{ .Values.schema.format }} python files/client.py sample

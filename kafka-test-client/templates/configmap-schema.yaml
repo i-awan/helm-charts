@@ -1,0 +1,12 @@
+{{- if not .Values.schema.existingConfigMap }}
+{{- $inline := required "Pass the schema: --set-file schema.inline=./your-schema.avsc (or set schema.existingConfigMap)" .Values.schema.inline }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ktc.fullname" . }}-schema
+  labels:
+    {{- include "ktc.labels" . | nindent 4 }}
+data:
+  schema: |
+    {{- $inline | trim | nindent 4 }}
+{{- end }}

@@ -1,0 +1,6 @@
+# One topic per file. Rendered into a CFK KafkaTopic by templates/topics.yaml.
+name: orders
+partitions: 2
+# replicas: 3            # optional; defaults to cluster.replicationFactor
+configs:                 # optional; values must be strings
+  retention.ms: "604800000"

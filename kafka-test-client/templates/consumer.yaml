@@ -1,0 +1,36 @@
+{{- if .Values.consumer.enabled }}
+{{- $kind := .Values.consumer.kind }}
+{{- if not (has $kind (list "Job" "Deployment")) }}
+{{- fail "consumer.kind must be Job or Deployment" }}
+{{- end }}
+{{- if and (eq $kind "Job") (eq (int .Values.consumer.maxMessages) 0) (eq (int .Values.consumer.idleTimeoutSeconds) 0) }}
+{{- fail "consumer.kind=Job needs consumer.maxMessages > 0 or consumer.idleTimeoutSeconds > 0, otherwise it never finishes" }}
+{{- end }}
+{{- $configHash := printf "%s%s" (include (print $.Template.BasePath "/configmap-app.yaml") .) (include (print $.Template.BasePath "/configmap-schema.yaml") .) | sha256sum }}
+apiVersion: {{ if eq $kind "Job" }}batch/v1{{ else }}apps/v1{{ end }}
+kind: {{ $kind }}
+metadata:
+  {{- /* A Job's pod template is immutable, so each helm revision gets its own Job. */}}
+  name: {{ include "ktc.fullname" . }}-consumer{{ if eq $kind "Job" }}-r{{ .Release.Revision }}{{ end }}
+  labels:
+    {{- include "ktc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: consumer
+spec:
+  {{- if eq $kind "Job" }}
+  backoffLimit: {{ .Values.consumer.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.consumer.ttlSecondsAfterFinished }}
+  {{- else }}
+  replicas: {{ .Values.consumer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ktc.selectorLabels" (dict "root" . "component" "consumer") | nindent 6 }}
+  {{- end }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ $configHash }}
+      labels:
+        {{- include "ktc.selectorLabels" (dict "root" . "component" "consumer") | nindent 8 }}
+    spec:
+      {{- include "ktc.podSpec" (dict "root" . "mode" "consume" "roleEnv" (include "ktc.consumerEnv" .) "restartPolicy" (ternary "Never" "Always" (eq $kind "Job")) "resources" .Values.consumer.resources) | nindent 6 }}
+{{- end }}

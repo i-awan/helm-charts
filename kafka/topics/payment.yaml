@@ -1,0 +1,5 @@
+name: payment
+partitions: 2
+configs:
+  retention.ms: "604800000"
+  cleanup.policy: "delete"

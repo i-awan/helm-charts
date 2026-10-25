@@ -1,0 +1,30 @@
+{{- if and .Values.topics.enabled (eq .Values.region.mode "full") }}
+{{- range $path, $_ := .Files.Glob "topics/*.yaml" }}
+{{- $t := $.Files.Get $path | fromYaml }}
+---
+# Rendered from {{ $path }}
+apiVersion: platform.confluent.io/v1beta1
+kind: KafkaTopic
+metadata:
+  # CR names must be DNS-1123 (lowercase, no "_" or "."); the real topic
+  # name goes in spec.name below.
+  name: {{ $t.name | lower | replace "_" "-" | replace "." "-" }}
+  namespace: {{ $.Values.namespace }}
+spec:
+  name: {{ $t.name }}
+  replicas: {{ $t.replicas | default $.Values.cluster.replicationFactor }}
+  partitionCount: {{ $t.partitions | default 3 }}
+  {{- with $t.configs }}
+  configs:
+    {{- range $k, $v := . }}
+    {{ $k | quote }}: {{ $v | toString | quote }}
+    {{- end }}
+  {{- end }}
+  kafkaClusterRef:
+    name: {{ $.Values.cluster.name }}
+  {{- with $.Values.topics.kafkaRestClassRef }}
+  kafkaRestClassRef:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

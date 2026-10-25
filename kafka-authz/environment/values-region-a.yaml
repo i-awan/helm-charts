@@ -1,0 +1,157 @@
+# region-a  - full region (brokers + controller). Bootstraps first: its
+# KRaftController generates the clusterID that gets fetched and pasted
+# into values-region-b.yaml / values-05dc.yaml before installing those.
+#
+# Works whether region-a/b/05dc are three namespaces on ONE cluster, or
+# three genuinely separate clusters  - the only thing that changes
+# between those two cases is staticQuorumVoters below (see its comment)
+# and whether you add --kube-context to your helm/kubectl commands.
+# Everything else in this file is identical either way.
+
+namespace: kafka-region-a
+
+region:
+  name: region-a
+  mode: full
+
+# Two SEPARATE flags, both needed together for working encryption:
+#   tls.enabled           - turns on TLS on the actual Kafka/KRaftController
+#                          listeners (this is what templates read to decide
+#                          whether a connection is encrypted at all)
+#   tls.certManager.enabled  - controls HOW the cert gets created/managed
+#                          (cert-manager's shared-CA pattern, vs. the
+#                          manual generate-and-distribute-tls.sh script)
+# Setting only one of these either creates certs nothing uses, or turns
+# on TLS with no cert to actually use  - both are required together.
+tls:
+  enabled: true
+  # Mutual TLS on the broker/controller listeners - must be true on EVERY
+  # region's values file (peers verify each other across regions).
+  mtls:
+    enabled: true
+  certManager:
+    enabled: true   # must be set true on EVERY region's values file, not just here
+    # region-a is the designated root for the shared-CA cert-manager
+    # pattern (values.yaml tls.certManager)  - same "generate once,
+    # fetch/propagate elsewhere" role it plays for clusterID below.
+    bootstrapRoot: true
+    # THIS region's own DNS names - never copy another region's values
+    # here (a real bug we caught: values.yaml's base default used to
+    # hardcode region-a's names, which would have silently applied to
+    # every region).
+    dnsNames:
+      - kafka.kafka-region-a.svc.cluster.local
+      - "*.kafka-region-a.svc.cluster.local"
+    # Schema Registry and Control Center get their own certificates
+    # (own CN/SANs, same issuer). Same value in every region.
+    serviceCerts:
+      enabled: true
+
+# Control Center runs here only - one instance for the whole logical
+# cluster, not per-region. See values.yaml's controlCenter block for why
+# this must stay true in exactly ONE region's values file.
+controlCenter:
+  enabled: true
+  dataVolumeCapacity: 5Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1536Mi
+    limits:
+      cpu: "1"
+      memory: 3Gi
+authorization:
+  enabled: true
+  # Principals are the cert CNs (see tls.mtls.principalMappingRules). Every
+  # broker/controller must be a super user on every node, so the list is the
+  # same in all three regional files. Schema Registry and C3 are super users
+  # here for simplicity; replace with scoped ACLs/RBAC when hardening.
+  superUsers:
+    - User:region-a
+    - User:region-b
+    - User:region-05dc
+    - User:region-a-schemaregistry
+    - User:region-b-schemaregistry
+    - User:region-a-controlcenter
+
+controllerIdOffset: 100
+brokerIdOffset: 110
+
+# Left blank  - this region bootstraps first and generates the clusterID.
+cluster:
+  clusterID: ""
+  replicationFactor: 2   # 1 broker per region x 2 regions; must be identical in every region's file
+
+# REQUIRED  - without this, CFK falls back to its own internal default
+# node numbering instead of this chart's 100/200/300 convention (a real
+# quorum-formation bug we hit and fixed once already  - see README's
+# quorum section). Identical list required on every region's values file.
+#
+# Internal *.svc.cluster.local addresses  - correct as long as all three
+# regions are namespaces on ONE cluster. The moment region-a/b/05dc
+# become genuinely separate clusters, these stop resolving entirely and
+# must be swapped for real cross-cluster-reachable endpoints (see
+# README's "Connectivity required between the three sites").
+staticQuorumVoters:
+  - brokerEndpoint: kraftcontroller-region-a-0.kraftcontroller-region-a.kafka-region-a.svc.cluster.local:9074
+    nodeId: 100
+  - brokerEndpoint: kraftcontroller-region-b-0.kraftcontroller-region-b.kafka-region-b.svc.cluster.local:9074
+    nodeId: 200
+  - brokerEndpoint: kraftcontroller-region-05dc-0.kraftcontroller-region-05dc.kafka-region-05dc.svc.cluster.local:9074
+    nodeId: 300
+
+# Same internal-DNS caveat as staticQuorumVoters above  - fix once this
+# region's Kafka is genuinely on a different cluster than SchemaRegistry
+# expects. (This override used to only exist in the old mock-specific
+# values file  - the "real" file was silently relying on the wrong
+# default namespace this whole time until this consolidation caught it.)
+schemaRegistry:
+  kafkaBootstrapEndpoint: kafka.kafka-region-a.svc.cluster.local:9092
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 384Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+# Moderate, explicit sizing for a real dedicated cluster  - not the tiny
+# footprint from resource-constrained test VMs, but also not blindly
+# inheriting values.yaml's full production defaults (2-4 CPU / 8-16Gi
+# per broker, 500Gi storage) without knowing your actual cluster
+# capacity first. Bump up once you've confirmed the cluster handles this
+# comfortably.
+kraftController:
+  replicas: 1   # 1+1+1 topology (3 voters, majority 2) - see README quorum-survival section
+  storage:
+    class: ""   # use this cluster's default StorageClass
+    size: 2Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "500m"
+      memory: 1Gi
+
+kafka:
+  replicas: 1   # one broker per region (2 brokers total across region-a/b)
+  storage:
+    class: ""
+    size: 5Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  externalAccess:
+    enabled: false   # turn on once you actually need it  - see README's external-access section (loadBalancer/nodePort/route)
+
+# No node-label privileges, or haven't labeled yet? Leave this false  -
+# softens scheduling/anti-affinity instead of blocking on it. Once you
+# DO label nodes (topology.kubernetes.io/region=region-a, etc.), flip
+# this true for real fault isolation.
+nodeSelector:
+  enabled: false

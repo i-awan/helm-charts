@@ -1,0 +1,6 @@
+.git/
+.gitignore
+image/
+examples/
+*.swp
+*.bak

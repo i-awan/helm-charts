@@ -1,0 +1,142 @@
+apiVersion: platform.confluent.io/v1beta1
+kind: KRaftController
+metadata:
+  name: {{ include "kafka-2.5dc.controllerName" . }}
+  namespace: {{ .Values.namespace }}
+  annotations:
+    platform.confluent.io/broker-id-offset: {{ .Values.controllerIdOffset | quote }}
+spec:
+  replicas: {{ .Values.kraftController.replicas }}
+  {{- if .Values.cluster.clusterID }}
+  clusterID: {{ .Values.cluster.clusterID | quote }}
+  {{- end }}
+  {{- if .Values.authorization.enabled }}
+  authorization:
+    type: simple
+    superUsers:
+      {{- range .Values.authorization.superUsers }}
+      - {{ . | quote }}
+      {{- end }}
+  {{- end }}
+  {{- if and .Values.oauth.enabled .Values.oauth.clientSecretRef }}
+  # Same reasoning as the Kafka CR - the controller quorum listener is a
+  # SEPARATE listener (named "controller", not "internal"), so it needs
+  # its own mount even though it's the same underlying Secret.
+  mountedSecrets:
+    - {{ .Values.oauth.clientSecretRef }}
+  {{- end }}
+  image:
+    application: {{ .Values.image.controllerApplication }}
+    init: {{ .Values.image.controllerInit }}
+  dataVolumeCapacity: {{ .Values.kraftController.storage.size }}
+  {{- if .Values.kraftController.storage.class }}
+  storageClass:
+    name: {{ .Values.kraftController.storage.class }}
+  {{- end }}
+  podTemplate:
+    resources:
+      requests:
+        cpu: {{ .Values.kraftController.resources.requests.cpu | quote }}
+        memory: {{ .Values.kraftController.resources.requests.memory | quote }}
+      limits:
+        cpu: {{ .Values.kraftController.resources.limits.cpu | quote }}
+        memory: {{ .Values.kraftController.resources.limits.memory | quote }}
+    affinity:
+      podAntiAffinity:
+        {{- if not .Values.nodeSelector.enabled }}
+        # Soft preference when nodeSelector.enabled: false  - if you can't
+        # guarantee node labels, you likely can't guarantee enough
+        # distinct nodes for a hard requirement either. A required
+        # constraint here would leave pods Pending forever if there's
+        # nowhere else to schedule them.
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: kraftcontroller
+              topologyKey: kubernetes.io/hostname
+        {{- else }}
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: kraftcontroller
+            topologyKey: kubernetes.io/hostname
+        {{- end }}
+    {{- if and (not .Values.standalone) .Values.nodeSelector.enabled }}
+    nodeSelector:
+      # Requires nodes in this cluster to be labeled:
+      #   oc label node <node> topology.kubernetes.io/region={{ .Values.region.name }}
+      topology.kubernetes.io/region: {{ .Values.region.name }}
+    {{- end }}
+  {{- if or .Values.authorization.enabled .Values.staticQuorumVoters .Values.tls.mtls.enabled .Values.oauth.enabled }}
+  configOverrides:
+    server:
+      {{- if .Values.tls.mtls.enabled }}
+      # Same reasoning as the internal Kafka listener  - the controller
+      # listener carries Raft quorum traffic between controllers, who
+      # are simultaneously accepting AND initiating connections to each
+      # other, so this demands every peer present a verifiable cert too.
+      - listener.name.controller.ssl.client.auth=required
+      - {{ printf "ssl.principal.mapping.rules=%s" .Values.tls.mtls.principalMappingRules | quote }}
+      {{- end }}
+      {{- if .Values.staticQuorumVoters }}
+      # Static quorum via the raw Kafka property, not CFK's structured
+      # `listeners.controllerQuorumVoters` field  - that field was
+      # rejected as "unknown field" by this cluster's installed CRD
+      # version, so this is the version-independent fallback.
+      # configOverrides entries are appended after CFK's own generated
+      # config, so this correctly overrides whatever single-node default
+      # CFK would otherwise auto-generate.
+      #
+      # This SAME comma-separated voter list  - every controller across
+      # every region  - must appear identically on every region's
+      # KRaftController CR, not just a self-reference. Matching
+      # clusterID alone does not form one cross-namespace/cross-cluster
+      # quorum (confirmed the hard way  - see README).
+      - controller.quorum.voters={{ range $i, $v := .Values.staticQuorumVoters }}{{ if $i }},{{ end }}{{ $v.nodeId }}@{{ $v.brokerEndpoint }}{{ end }}
+      {{- end }}
+      {{- if .Values.authorization.enabled }}
+      - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      - confluent.authorizer.access.rule.providers=KRAFT_ACL
+      # super.users is ONE semicolon-separated property; repeating the key per user
+      # keeps only the last one.
+      - super.users={{ join ";" .Values.authorization.superUsers }}
+      {{- end }}
+      {{- if .Values.oauth.enabled }}
+      # Mirrors the Kafka CR's OAuth block, but on the controller
+      # listener (Raft quorum traffic, not client/inter-broker traffic) -
+      # every controller both accepts AND initiates connections to its
+      # peer controllers, so it needs the same server+client pair.
+      # Scoped to the controller listener, not global - see the Kafka
+      # CR for why a global sasl.enabled.mechanisms is avoided.
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.sasl.enabled.mechanisms=OAUTHBEARER
+      - sasl.mechanism.controller.protocol=OAUTHBEARER
+      {{- if .Values.oauth.clientSecretRef }}
+      # Same DirectoryConfigProvider registration as the Kafka CR -
+      # see the comment there for why FileConfigProvider/${file:...}
+      # doesn't work against a mountedSecrets volume.
+      - config.providers=directory
+      - config.providers.directory.class=org.apache.kafka.common.config.provider.DirectoryConfigProvider
+      {{- end }}
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.server.callback.handler.class={{ .Values.oauth.serverLoginCallbackHandlerClass }}
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.login.callback.handler.class={{ .Values.oauth.clientLoginCallbackHandlerClass }}
+      {{- if .Values.oauth.clientSecretRef }}
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId="{{ .Values.oauth.clientId }}" clientSecret="${directory:/mnt/secrets/{{ .Values.oauth.clientSecretRef }}:{{ .Values.oauth.clientSecretKey }}}";
+      {{- end }}
+      - listener.name.{{ .Values.oauth.controllerListenerName }}.oauthbearer.sasl.oauthbearer.token.endpoint.url={{ .Values.oauth.tokenEndpointUrl }}
+      {{- end }}
+  {{- end }}
+  {{- if .Values.tls.enabled }}
+  # Global TLS cert for this CR (documented spec.tls.secretRef). Also what CFK
+  # means by '.spec.tls' in its "missing .spec.tls. in spec" InputError.
+  tls:
+    secretRef: {{ .Values.tls.secretRef }}
+  {{- end }}
+  listeners:
+    controller:
+      tls:
+        enabled: {{ .Values.tls.enabled }}
+        {{- if .Values.tls.enabled }}
+        secretRef: {{ .Values.tls.secretRef }}
+        {{- end }}

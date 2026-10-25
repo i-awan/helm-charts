@@ -1,0 +1,4 @@
+confluent-kafka[avro,json,schemaregistry]>=2.6,<3
+fastavro>=1.9
+jsonschema>=4.20
+exrex>=0.11

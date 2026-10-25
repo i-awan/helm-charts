@@ -1,0 +1,74 @@
+{{- if .Values.controlCenter.enabled }}
+# Gated on controlCenter.enabled directly (a plain flag set true in ONE
+# region's values file), not on region.mode - unlike SchemaRegistry,
+# Control Center isn't "one per full region", it's "one for the whole
+# logical cluster", so region.mode == "full" being true in BOTH region-a
+# and region-b would be the wrong gate here.
+apiVersion: platform.confluent.io/v1beta1
+kind: ControlCenter
+metadata:
+  name: {{ .Values.controlCenter.clusterRefName }}
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.controlCenter.replicas }}
+  image:
+    application: {{ .Values.controlCenter.image.application }}
+    init: {{ .Values.controlCenter.image.init }}
+  dataVolumeCapacity: {{ .Values.controlCenter.dataVolumeCapacity }}
+  {{- with .Values.controlCenter.configOverrides }}
+  {{- with .server }}
+  configOverrides:
+    server:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
+  {{- end }}
+  dependencies:
+    kafka:
+      # CC talks to the SAME logical cluster as everything else in this
+      # chart, via this region's own bootstrap endpoint - it reaches every
+      # broker across every region through that one cluster, the same way
+      # any other client does. No cross-region endpoint needed here.
+      bootstrapEndpoint: {{ .Values.schemaRegistry.kafkaBootstrapEndpoint }}
+      {{- if and .Values.tls.enabled .Values.tls.mtls.enabled }}
+      # Brokers demand a client cert (tls.mtls), so tell CFK to present one.
+      authentication:
+        type: mtls
+      {{- end }}
+      {{- if .Values.tls.enabled }}
+      tls:
+        enabled: true
+        secretRef: {{ include "kafka-2.5dc.tlsSecret.controlCenter" . }}
+      {{- end }}
+    {{- if .Values.schemaRegistry.enabled }}
+    schemaRegistry:
+      # Local to this region - fine, since CC only ever runs in the one
+      # region that also has region.mode: full (and therefore its own
+      # SchemaRegistry CR already, per schemaregistry.yaml's gating).
+      url: {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.schemaRegistry.clusterRefName }}.{{ .Values.namespace }}.svc.cluster.local:8081
+      {{- if .Values.tls.enabled }}
+      tls:
+        enabled: true
+        secretRef: {{ include "kafka-2.5dc.tlsSecret.controlCenter" . }}
+      {{- end }}
+    {{- end }}
+  podTemplate:
+    resources:
+      requests:
+        cpu: {{ .Values.controlCenter.resources.requests.cpu | quote }}
+        memory: {{ .Values.controlCenter.resources.requests.memory | quote }}
+      limits:
+        cpu: {{ .Values.controlCenter.resources.limits.cpu | quote }}
+        memory: {{ .Values.controlCenter.resources.limits.memory | quote }}
+    {{- if and (not .Values.standalone) .Values.nodeSelector.enabled }}
+    nodeSelector:
+      topology.kubernetes.io/region: {{ .Values.region.name }}
+    {{- end }}
+  {{- if .Values.tls.enabled }}
+  # CC's OWN web UI/API TLS. ControlCenter's CRD has no spec.listeners
+  # (confirmed with `oc explain controlcenter.spec.listeners`), so the global
+  # spec.tls is the only place to set it. This is separate from the TLS it
+  # uses to talk OUT to Kafka/SchemaRegistry above.
+  tls:
+    secretRef: {{ include "kafka-2.5dc.tlsSecret.controlCenter" . }}
+  {{- end }}
+{{- end }}
